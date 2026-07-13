@@ -26,7 +26,7 @@ const { useState, useEffect, useMemo, useRef } = React;
    means each account can only ever read/write its own rows.
    ============================================================ */
 const SUPABASE_URL = "https://tixamocczspyibjvcxdg.supabase.co";
-const SUPABASE_ANON_KEY = "PASTE_YOUR_ANON_KEY_HERE";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRpeGFtb2NjenNweWlianZjeGRnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM5MDQzNDEsImV4cCI6MjA5OTQ4MDM0MX0.sXiW05rF2hP8QA-Fm9y3TMgJQQXY21mFe40F8DyDxRI";
 
 function getConfig() {
   if (SUPABASE_URL.startsWith("https://")) return { url: SUPABASE_URL, key: SUPABASE_ANON_KEY };
