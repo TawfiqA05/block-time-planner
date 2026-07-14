@@ -937,6 +937,132 @@ Respond with ONLY valid JSON, no prose: {"blocks":[{"title":string,"category":"p
   };
 }
 
+/* ============================================================
+   QUICK CAPTURE — turn free text or a photo into commitments + tasks
+   ============================================================ */
+async function aiExtract({
+  groqKey,
+  geminiKey,
+  text,
+  imageDataUrl,
+  dateKey
+}) {
+  const instr = `You extract planning data. From the provided ${imageDataUrl ? "image (and any text)" : "text"}, extract items relevant to scheduling around ${dateKey}.
+Return ONLY JSON, no prose: {"commitments":[{"title":string,"start":"HH:MM","end":"HH:MM"}],"tasks":[{"title":string,"due":"YYYY-MM-DD" or null}]}
+Rules: commitments are things with a fixed clock time (classes, meetings, appointments, shifts) in 24h time; if an end time is missing, estimate a sensible one. tasks are to-dos without a fixed time; extract a due date only if one is clearly stated or implied. Keep titles short. Ignore decoration, headers, and anything that is not actionable.`;
+  const parseJson = t => {
+    const s = String(t);
+    const a = s.indexOf("{"),
+      b = s.lastIndexOf("}");
+    if (a === -1 || b === -1) throw new Error("no JSON in reply");
+    const p = JSON.parse(s.slice(a, b + 1));
+    const hhmm = /^\d{1,2}:\d{2}$/;
+    return {
+      commitments: (Array.isArray(p.commitments) ? p.commitments : []).filter(c => c && c.title && hhmm.test(String(c.start || ""))).map(c => ({
+        title: String(c.title).slice(0, 60),
+        start: String(c.start).padStart(5, "0"),
+        end: hhmm.test(String(c.end || "")) ? String(c.end).padStart(5, "0") : null
+      })).slice(0, 12),
+      tasks: (Array.isArray(p.tasks) ? p.tasks : []).filter(t2 => t2 && t2.title).map(t2 => ({
+        title: String(t2.title).slice(0, 80),
+        due: /^\d{4}-\d{2}-\d{2}$/.test(String(t2.due || "")) ? t2.due : null
+      })).slice(0, 20)
+    };
+  };
+  if (imageDataUrl) {
+    if (!geminiKey) throw new Error("NO_GEMINI");
+    const b64 = imageDataUrl.split(",")[1];
+    const mime = (imageDataUrl.match(/^data:([^;]+)/) || [])[1] || "image/jpeg";
+    let lastErr = null;
+    for (const model of ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]) {
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{
+                text: instr + (text ? "\n\nAdditional text from the user:\n" + text : "")
+              }, {
+                inline_data: {
+                  mime_type: mime,
+                  data: b64
+                }
+              }]
+            }]
+          })
+        });
+        if (!r.ok) throw new Error("Gemini " + r.status);
+        const d = await r.json();
+        const out = d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts ? d.candidates[0].content.parts.map(p => p.text || "").join("") : "";
+        return parseJson(out);
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("photo extraction failed");
+  }
+  // text-only: Groq cascade
+  let lastErr = null;
+  for (const model of ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]) {
+    try {
+      const body = {
+        model,
+        temperature: 0.2,
+        max_tokens: 2000,
+        response_format: {
+          type: "json_object"
+        },
+        messages: [{
+          role: "system",
+          content: "You output only strict JSON."
+        }, {
+          role: "user",
+          content: instr + "\n\nTEXT:\n" + text
+        }]
+      };
+      if (model.includes("gpt-oss")) body.reasoning_effort = "low";
+      const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${groqKey}`
+        },
+        body: JSON.stringify(body)
+      });
+      if (!r.ok) throw new Error("Groq " + r.status);
+      const d = await r.json();
+      return parseJson(d.choices[0].message.content);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("extraction failed");
+}
+function downscaleImage(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 1280;
+        const sc = Math.min(1, max / Math.max(img.width, img.height));
+        const cv = document.createElement("canvas");
+        cv.width = Math.round(img.width * sc);
+        cv.height = Math.round(img.height * sc);
+        cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+        resolve(cv.toDataURL("image/jpeg", 0.85));
+      };
+      img.onerror = reject;
+      img.src = fr.result;
+    };
+    fr.onerror = reject;
+    fr.readAsDataURL(file);
+  });
+}
+
 /* ============================================================ */
 function App() {
   const [step, setStep] = useState("loading"); // loading | setup | input | questions | schedule | settings
@@ -954,6 +1080,10 @@ function App() {
   });
   const [tplName, setTplName] = useState("");
   const [weather, setWeather] = useState(null);
+  const [capText, setCapText] = useState("");
+  const [capImg, setCapImg] = useState(null);
+  const [capBusy, setCapBusy] = useState(false);
+  const [capMsg, setCapMsg] = useState("");
   const [returnTo, setReturnTo] = useState("input");
 
   // per-plan state
@@ -1135,6 +1265,59 @@ function App() {
       ...prev,
       ...tp.q
     }));
+  };
+  const runCapture = async () => {
+    if (capBusy || !capText.trim() && !capImg) return;
+    setCapBusy(true);
+    setCapMsg("");
+    try {
+      const res = await aiExtract({
+        groqKey: (settings.groqKey || "").trim(),
+        geminiKey: (settings.geminiKey || "").trim(),
+        text: capText.trim(),
+        imageDataUrl: capImg,
+        dateKey
+      });
+      let addedC = 0,
+        addedT = 0,
+        addedB = 0;
+      if (res.commitments.length) {
+        setOneOffs(prev => [...prev, ...res.commitments.map(c => ({
+          title: c.title,
+          start: c.start,
+          end: c.end || toInputVal(fromInputVal(c.start) + 60)
+        }))]);
+        addedC = res.commitments.length;
+      }
+      const bl = [...backlog];
+      let taskAdd = [];
+      for (const t of res.tasks) {
+        if (t.due && t.due > dateKey) {
+          bl.push({
+            id: uid(),
+            title: t.title,
+            due: t.due,
+            done: false
+          });
+          addedB++;
+        } else {
+          taskAdd.push(t.title);
+          addedT++;
+        }
+      }
+      if (addedB) await persistBacklog(bl);
+      if (taskAdd.length) setTaskText(prev => {
+        const lines = prev.split("\n").map(x => x.trim());
+        const add = taskAdd.filter(x => !lines.includes(x));
+        return (prev.trim() ? prev + "\n" : "") + add.join("\n");
+      });
+      setCapMsg(addedC + addedT + addedB === 0 ? "Nothing actionable found — try adding a bit more detail." : `Added ${addedC} commitment${addedC === 1 ? "" : "s"} · ${addedT} task${addedT === 1 ? "" : "s"} today · ${addedB} to backlog`);
+      setCapText("");
+      setCapImg(null);
+    } catch (e) {
+      setCapMsg(e.message === "NO_GEMINI" ? "Photos need a free Gemini key — add one in Settings (aistudio.google.com)." : "Couldn't process that — check your connection and try again.");
+    }
+    setCapBusy(false);
   };
 
   // weather for the plan date (Open-Meteo, free, no key)
@@ -1603,6 +1786,77 @@ function App() {
         end: ""
       }])
     }, "+ Add commitment")), /*#__PURE__*/React.createElement("div", {
+      className: "card",
+      style: {
+        borderColor: "rgba(227,168,87,.3)"
+      }
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "✨ Quick capture — dump thoughts or snap a syllabus/flyer/list, AI breaks it into blocks"), /*#__PURE__*/React.createElement("textarea", {
+      placeholder: "e.g. dentist wednesday 2pm, need to renew parking permit before aug, mom asked me to grab groceries…",
+      value: capText,
+      onChange: e => setCapText(e.target.value),
+      style: {
+        minHeight: 70,
+        marginBottom: 8
+      }
+    }), capImg && /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      style: {
+        marginBottom: 8
+      }
+    }, /*#__PURE__*/React.createElement("img", {
+      src: capImg,
+      alt: "capture",
+      style: {
+        height: 54,
+        borderRadius: 8,
+        border: "1px solid var(--line)"
+      }
+    }), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      onClick: () => setCapImg(null)
+    }, "Remove photo")), /*#__PURE__*/React.createElement("div", {
+      className: "row"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "chip",
+      style: {
+        cursor: "pointer"
+      }
+    }, "📷 Photo", /*#__PURE__*/React.createElement("input", {
+      type: "file",
+      accept: "image/*",
+      style: {
+        display: "none"
+      },
+      onChange: async e => {
+        const f = e.target.files && e.target.files[0];
+        e.target.value = "";
+        if (!f) return;
+        try {
+          setCapImg(await downscaleImage(f));
+          setCapMsg("");
+        } catch (err) {
+          setCapMsg("Couldn't read that image.");
+        }
+      }
+    })), /*#__PURE__*/React.createElement("button", {
+      className: "chip grow",
+      style: {
+        background: capBusy ? undefined : "rgba(227,168,87,.16)",
+        borderColor: "var(--amber)",
+        color: "var(--amber)",
+        fontWeight: 700
+      },
+      onClick: runCapture,
+      disabled: capBusy
+    }, capBusy ? "Breaking it down…" : "✨ Break it down")), capMsg && /*#__PURE__*/React.createElement("div", {
+      className: "mini",
+      style: {
+        marginTop: 8,
+        color: "#E3A857"
+      }
+    }, capMsg)), /*#__PURE__*/React.createElement("div", {
       className: "card"
     }, /*#__PURE__*/React.createElement("label", {
       className: "fld"
@@ -1653,6 +1907,9 @@ function App() {
         ...nb,
         title: e.target.value
       }),
+      onKeyDown: e => {
+        if (e.key === "Enter") addBacklogItem();
+      },
       className: "grow"
     }), /*#__PURE__*/React.createElement("input", {
       type: "date",
@@ -1939,6 +2196,19 @@ function App() {
           fontStyle: "italic"
         }
       }, "\"", p.review.note, "\"") : null), /*#__PURE__*/React.createElement("button", {
+        className: "chip",
+        onClick: e => {
+          e.stopPropagation();
+          const src2 = p && Array.isArray(p.blocks) ? p.blocks : [];
+          setTaskText(src2.filter(b => b.cat === "task" || b.cat === "deep").map(b => b.title.replace(/^Deep work — /, "")).join("\n"));
+          setOneOffs(src2.filter(b => b.cat === "fixed").map(b => ({
+            title: b.title,
+            start: toInputVal(b.start),
+            end: toInputVal(b.end)
+          })));
+          setStep("input");
+        }
+      }, "Reuse"), /*#__PURE__*/React.createElement("button", {
         className: "chip",
         onClick: e => {
           e.stopPropagation();
@@ -2726,6 +2996,7 @@ function SettingsView({
   const [jumuahTime, setJumuahTime] = useState(settings?.jumuahTime || "13:30");
   const [includeQuran, setIncludeQuran] = useState(settings ? settings.includeQuran !== false : true);
   const [groqKey, setGroqKey] = useState(settings?.groqKey || "");
+  const [geminiKey, setGeminiKey] = useState(settings?.geminiKey || "");
   const [aiProfile, setAiProfile] = useState(settings?.aiProfile || "21-year-old Muslim college student in Fishers, Indiana. ~40 minute commute each way to campus/downtown Indianapolis. Prays 5x daily, non-negotiable. Health-conscious: whole foods, hydration, gym/tennis/pickleball. Protects sleep. Biomedical informatics coursework and research need real deep-focus blocks.");
   const [wake, setWake] = useState(settings?.wake || "06:00");
   const [sleep, setSleep] = useState(settings?.sleep || "23:00");
@@ -2766,6 +3037,7 @@ function SettingsView({
       wake,
       sleep,
       groqKey: groqKey.trim(),
+      geminiKey: geminiKey.trim(),
       aiProfile: aiProfile.trim(),
       attendJumuah,
       jumuahTime,
@@ -3031,12 +3303,26 @@ function SettingsView({
     style: {
       marginBottom: 8
     }
+  }), /*#__PURE__*/React.createElement("label", {
+    className: "fld",
+    style: {
+      marginTop: 10
+    }
+  }, "Gemini API key (optional — enables photo capture)"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    autoCapitalize: "none",
+    placeholder: "AIza...",
+    value: geminiKey,
+    onChange: e => setGeminiKey(e.target.value),
+    style: {
+      marginBottom: 8
+    }
   }), /*#__PURE__*/React.createElement("div", {
     className: "mini",
     style: {
       marginBottom: 10
     }
-  }, "With a key, the AI analyzes your task list — estimating durations, spotting deadlines, adding commute blocks — and plans the whole day itself. Without one, a simpler rule-based planner is used. Get a free key at console.groq.com → API Keys. Syncs to your devices; never put it in the code on GitHub."), /*#__PURE__*/React.createElement("label", {
+  }, "Free at aistudio.google.com → Get API key. Only needed for turning photos into plans; everything else runs on the Groq key. With a Groq key, the AI analyzes your task list — estimating durations, spotting deadlines, adding commute blocks — and plans the whole day itself. Without one, a simpler rule-based planner is used. Get a free key at console.groq.com → API Keys. Syncs to your devices; never put it in the code on GitHub."), /*#__PURE__*/React.createElement("label", {
     className: "fld"
   }, "What the AI should know about you (editable)"), /*#__PURE__*/React.createElement("textarea", {
     value: aiProfile,
