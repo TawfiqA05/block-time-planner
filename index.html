@@ -142,7 +142,7 @@ const ANCHORED = {
   fixed: true,
   sleep: true
 };
-function reflowBlocks(orderIds, blocks, dayStart) {
+function reflowBlocks(orderIds, blocks, dayStart, draggedId) {
   const byId = {};
   blocks.forEach(b => {
     byId[b.id] = b;
@@ -158,7 +158,9 @@ function reflowBlocks(orderIds, blocks, dayStart) {
       continue;
     }
     const dur = Math.max(5, b.end - b.start);
-    let start = t;
+    // only the dragged block gets fully re-timed; everything else keeps its
+    // original start unless the new order genuinely forces a push
+    let start = b.id === draggedId ? t : Math.max(b.start, t);
     for (let g = 0; g < 100; g++) {
       const clash = anchors.find(a => a.start < start + dur && a.end > start);
       if (!clash) break;
@@ -2199,14 +2201,20 @@ function ScheduleView({
         break;
       }
     }
+    const byId2 = {};
+    blocks.forEach(b => {
+      byId2[b.id] = b;
+    });
+    const sleepPos = ids.findIndex(x => byId2[x] && byId2[x].cat === "sleep");
+    if (sleepPos !== -1 && idx > sleepPos) idx = sleepPos;
     const next = [...ids.slice(0, idx), dragId, ...ids.slice(idx)];
     if (!previewIds || next.join() !== previewIds.join()) setPreviewIds(next);
   };
   const dragDrop = () => {
     const original = blocks.map(b => b.id).join();
     if (previewIds && previewIds.join() !== original) {
-      const out = reflowBlocks(previewIds, blocks, dayStart);
-      const nd = Math.max(dayEnd, ...out.map(b => b.end));
+      const out = reflowBlocks(previewIds, blocks, dayStart, dragId);
+      const nd = Math.max(...out.map(b => b.end));
       onAutoSave({
         ...plan,
         blocks: out,
