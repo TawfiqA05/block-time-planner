@@ -837,7 +837,10 @@ async function aiSchedule(cfg, key, profile) {
 HARD RULES:
 1. The five prayers are immovable anchors. Each prayer block runs from 10 minutes BEFORE its adhan time (wudu) to 25 minutes after it. Never move, shrink, or skip a prayer, and nothing may overlap one.
 2. Include every fixed_commitment at its exact time. If one overlaps a prayer, split it around the prayer with the note "step out to pray, then resume".
-3. THINK about each task in tasks_free_text: decide what it really is and estimate a realistic duration yourself (quick email ~15m, homework/assignment 60-120m, big vague projects get a focused 90m "start" block). Split anything over 120m into parts across the day. Infer urgency and deadlines from the wording ("due tonight" must finish before that deadline) and schedule urgent items earlier and in better slots.
+3. THINK about each task in tasks_free_text: decide what it really is and estimate a realistic duration yourself (quick email ~15m, homework/assignment 60-120m, big vague projects get a focused 90m "start" block). Split anything over 120m into parts across the day.
+3b. STATED TIMES ARE LAW: if a task mentions an explicit clock time or deadline ("pick up Sarah at 3pm", "movies at 9:00 PM", "leave by 7:50", "due 11:59 PM"), that time is a HARD constraint exactly like fixed_commitments. The block must sit at that stated time — "at 3pm" starts at 15:00 sharp; "by X" or "leave by X" means the activity ENDS or DEPARTS by X. Never shift, round, or reinterpret a stated time, and schedule surrounding items (commutes, prep) so the stated time is hit.
+3c. RELATIVE ORDER IS LAW: phrases like "after work", "before bed", "while at work", "on the way home" are ordering constraints — honor them literally ("while at work" goes inside the work block's hours; "before bed" goes after dinner and before wind-down; "after work" goes after the workday ends).
+3d. COMPLETENESS: every single task in tasks_free_text MUST appear as at least one block. Dropping an item is a failure.
 4. Deep/study work goes in the highest-energy windows given energy and hours_slept (high energy: morning after breakfast; low energy: late morning, only after food and light). Protect these blocks from fragmentation.
 5. If a workout is given, it is a real block: at least 60m after any meal, ending 15m clear of any prayer; add a hydration/cooldown note.
 6. Meals are unhurried (25-40m), placed near prayers where natural; dinner at least 2.5h before sleep; favor whole foods in notes.
@@ -855,7 +858,7 @@ Respond with ONLY valid JSON, no prose: {"blocks":[{"title":string,"category":"p
   const call = async model => {
     const body = {
       model,
-      temperature: 0.3,
+      temperature: 0.2,
       max_tokens: 6000,
       response_format: {
         type: "json_object"
@@ -877,7 +880,7 @@ Respond with ONLY valid JSON, no prose: {"blocks":[{"title":string,"category":"p
       },
       body: JSON.stringify(body)
     });
-    if (!r.ok) throw new Error("Groq error " + r.status);
+    if (!r.ok) throw new Error("Groq " + r.status + ": " + (await r.text()).slice(0, 140));
     const d = await r.json();
     return d.choices[0].message.content;
   };
@@ -928,6 +931,44 @@ Respond with ONLY valid JSON, no prose: {"blocks":[{"title":string,"category":"p
       end: tt + 25,
       note: "Anchor — restored"
     });
+  }
+  // completeness net: any task the model dropped gets placed in an open gap so it can never vanish
+  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const STOP = ["that", "this", "with", "need", "some", "them", "then", "from", "have", "will", "your", "like", "into", "just", "been", "over", "also", "what", "when", "goes", "gets"];
+  const covered = task => {
+    const tn = norm(task);
+    const words = tn.split(" ").filter(w => w.length > 3 && STOP.indexOf(w) === -1);
+    return blocks.some(b => {
+      const bn = norm(b.title) + " " + norm(b.note);
+      if (bn.includes(tn) || tn.includes(norm(b.title))) return true;
+      if (!words.length) return false;
+      const hit = words.filter(w => bn.includes(w)).length;
+      return hit >= 2 || hit / words.length >= 0.5;
+    });
+  };
+  const missing = (tasks || []).filter(t => t && !covered(t));
+  if (missing.length) {
+    const occ = blocks.map(b => [b.start, b.end]).sort((a, b) => a[0] - b[0]);
+    let cursor = wake;
+    const gaps = [];
+    for (const [s2, e2] of occ) {
+      if (s2 - cursor >= 40) gaps.push([cursor, s2]);
+      cursor = Math.max(cursor, e2);
+    }
+    if (sleep - cursor >= 40) gaps.push([cursor, sleep]);
+    for (const m of missing) {
+      const g2 = gaps.find(g => g[1] - g[0] >= 40);
+      if (!g2) break;
+      blocks.push({
+        id: uid(),
+        title: String(m).slice(0, 80),
+        cat: "task",
+        start: g2[0] + 5,
+        end: g2[0] + 35,
+        note: "AI missed this — placed automatically, drag to adjust"
+      });
+      g2[0] += 40;
+    }
   }
   blocks.sort((a, b) => a.start - b.start || a.end - b.end);
   const dayEnd = Math.max(sleep + 30, blocks[blocks.length - 1].end);
@@ -994,7 +1035,7 @@ Rules: commitments are things with a fixed clock time (classes, meetings, appoin
             }]
           })
         });
-        if (!r.ok) throw new Error("Gemini " + r.status);
+        if (!r.ok) throw new Error("Gemini " + r.status + ": " + (await r.text()).slice(0, 140));
         const d = await r.json();
         const out = d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts ? d.candidates[0].content.parts.map(p => p.text || "").join("") : "";
         return parseJson(out);
@@ -1032,7 +1073,7 @@ Rules: commitments are things with a fixed clock time (classes, meetings, appoin
         },
         body: JSON.stringify(body)
       });
-      if (!r.ok) throw new Error("Groq " + r.status);
+      if (!r.ok) throw new Error("Groq " + r.status + ": " + (await r.text()).slice(0, 140));
       const d = await r.json();
       return parseJson(d.choices[0].message.content);
     } catch (e) {
@@ -1315,7 +1356,8 @@ function App() {
       setCapText("");
       setCapImg(null);
     } catch (e) {
-      setCapMsg(e.message === "NO_GEMINI" ? "Photos need a free Gemini key — add one in Settings (aistudio.google.com)." : "Couldn't process that — check your connection and try again.");
+      const msg = String(e && e.message || "");
+      if (msg === "NO_GEMINI") setCapMsg("Photos need a free Gemini key — add one in Settings (get it at aistudio.google.com).");else if (/400|401|403|API key|invalid|expired/i.test(msg)) setCapMsg("The AI service rejected the key (" + msg.slice(0, 90) + "). Re-check it in Settings — copy the whole key, no spaces.");else if (/429/.test(msg)) setCapMsg("Rate limited — give it a minute, then try again.");else if (/JSON/i.test(msg)) setCapMsg("The AI's reply wasn't usable this time — tap Break it down again.");else setCapMsg("Failed: " + (msg.slice(0, 110) || "unknown error") + ". This is usually the key or the AI service — not your wifi.");
     }
     setCapBusy(false);
   };
