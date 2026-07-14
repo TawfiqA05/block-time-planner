@@ -91,6 +91,44 @@ function icsForPlan(plan) {
   return `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//blocktime//EN\r\n${ev}\r\nEND:VCALENDAR`;
 }
 
+/* ---------- drag reflow: keep anchors, re-time movables in new order ---------- */
+const ANCHORED = {
+  prayer: true,
+  fixed: true,
+  sleep: true
+};
+function reflowBlocks(orderIds, blocks, dayStart) {
+  const byId = {};
+  blocks.forEach(b => {
+    byId[b.id] = b;
+  });
+  const seq = orderIds.map(id => byId[id]).filter(Boolean);
+  const anchors = seq.filter(b => ANCHORED[b.cat]);
+  let t = dayStart;
+  const out = [];
+  for (const b of seq) {
+    if (ANCHORED[b.cat]) {
+      out.push(b);
+      t = Math.max(t, b.end + 5);
+      continue;
+    }
+    const dur = Math.max(5, b.end - b.start);
+    let start = t;
+    for (let g = 0; g < 100; g++) {
+      const clash = anchors.find(a => a.start < start + dur && a.end > start);
+      if (!clash) break;
+      start = clash.end + 5;
+    }
+    out.push({
+      ...b,
+      start,
+      end: start + dur
+    });
+    t = start + dur + 5;
+  }
+  return out.sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
 /* ---------- prayer time calculation (solar, no network) ---------- */
 const METHODS = {
   ISNA: {
@@ -1165,6 +1203,10 @@ function App() {
     .gapdiv{color:var(--muted);font-family:'Spline Sans Mono',monospace;font-size:11px;text-align:center;padding:5px 0 13px;opacity:.75}
     .nowline{border-top:2px solid #E06E6E;margin:2px 0 10px;position:relative}
     .nowline span{position:absolute;right:0;top:-9px;background:#E06E6E;color:#12141C;font-size:10px;font-family:'Spline Sans Mono',monospace;border-radius:6px;padding:1px 7px;font-weight:700}
+    .blk.mov{padding-left:34px}
+    .handle{position:absolute;left:6px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:16px;padding:8px 6px;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
+    .handle:active{cursor:grabbing;color:var(--amber)}
+    .blk.dragging{border-color:var(--amber);box-shadow:0 10px 28px rgba(0,0,0,.55);opacity:.97;z-index:20;position:relative}
     .blk .t{font-weight:700;font-size:13.5px;line-height:1.25}
     .blk .tm{font-family:'Spline Sans Mono',monospace;font-size:10.5px;color:var(--muted)}
     .blk .nt{font-size:11.5px;color:var(--muted);line-height:1.3;margin-top:1px}
@@ -1609,6 +1651,9 @@ function ScheduleView({
     const i = setInterval(() => setNowRaw(new Date()), 30000);
     return () => clearInterval(i);
   }, []);
+  const [dragId, setDragId] = useState(null);
+  const [previewIds, setPreviewIds] = useState(null);
+  const cardRefs = useRef({});
   const PPM = 1.15; // px per minute
   const {
     blocks,
@@ -1643,6 +1688,38 @@ function ScheduleView({
     a.href = URL.createObjectURL(blob);
     a.download = `blocktime-${plan.dateKey}.ics`;
     a.click();
+  };
+  const dragMove = e => {
+    if (!dragId) return;
+    const y = e.clientY;
+    if (y < 90) window.scrollBy(0, -14);else if (y > window.innerHeight - 110) window.scrollBy(0, 14);
+    const ids = (previewIds || blocks.map(b => b.id)).filter(id => id !== dragId);
+    let idx = ids.length;
+    for (let i = 0; i < ids.length; i++) {
+      const el = cardRefs.current[ids[i]];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (y < r.top + r.height / 2) {
+        idx = i;
+        break;
+      }
+    }
+    const next = [...ids.slice(0, idx), dragId, ...ids.slice(idx)];
+    if (!previewIds || next.join() !== previewIds.join()) setPreviewIds(next);
+  };
+  const dragDrop = () => {
+    const original = blocks.map(b => b.id).join();
+    if (previewIds && previewIds.join() !== original) {
+      const out = reflowBlocks(previewIds, blocks, dayStart);
+      const nd = Math.max(dayEnd, ...out.map(b => b.end));
+      onAutoSave({
+        ...plan,
+        blocks: out,
+        dayEnd: nd
+      });
+    }
+    setDragId(null);
+    setPreviewIds(null);
   };
   const pct = t => Math.max(0, Math.min(100, (t - dayStart) / (dayEnd - dayStart) * 100));
   const railBg = prayers ? `linear-gradient(180deg,#151a2e 0%,#151a2e ${pct(prayers.fajr)}%,#E3A857 ${pct(prayers.sunrise)}%,#8fa3c4 ${pct(prayers.sunrise) + 6}%,#8fa3c4 ${pct(prayers.maghrib) - 6}%,#E3A857 ${pct(prayers.maghrib)}%,#151a2e ${pct(prayers.isha)}%,#0e1120 100%)` : "#2C3245";
@@ -1699,7 +1776,7 @@ function ScheduleView({
     onBack: onReplan
   }), /*#__PURE__*/React.createElement("div", {
     className: "eyebrow"
-  }, "Step 3 of 3 · Tap any block to adjust it"), /*#__PURE__*/React.createElement("h2", null, new Date(plan.dateKey + "T12:00").toLocaleDateString(undefined, {
+  }, "Tap a block to edit · hold ⠿ to drag — times reflow around your prayers"), /*#__PURE__*/React.createElement("h2", null, new Date(plan.dateKey + "T12:00").toLocaleDateString(undefined, {
     weekday: "long",
     month: "long",
     day: "numeric"
@@ -1743,32 +1820,59 @@ function ScheduleView({
       background: railBg
     }
   }), (() => {
+    const byId = {};
+    blocks.forEach(b => {
+      byId[b.id] = b;
+    });
+    const listIds = previewIds || blocks.map(b => b.id);
     const items = [];
     let prevEnd = dayStart;
-    let nowPlaced = !isToday || nm < dayStart - 5 || nm > dayEnd;
-    blocks.forEach((b, idx) => {
-      if (!nowPlaced && nm <= b.start) {
-        items.push(/*#__PURE__*/React.createElement("div", {
-          key: "now",
-          className: "nowline"
-        }, /*#__PURE__*/React.createElement("span", null, fmt(nm))));
-        nowPlaced = true;
+    let nowPlaced = dragId != null || !isToday || nm < dayStart - 5 || nm > dayEnd;
+    listIds.forEach((id, idx) => {
+      const b = byId[id];
+      if (!b) return;
+      if (!dragId) {
+        if (!nowPlaced && nm <= b.start) {
+          items.push(/*#__PURE__*/React.createElement("div", {
+            key: "now",
+            className: "nowline"
+          }, /*#__PURE__*/React.createElement("span", null, fmt(nm))));
+          nowPlaced = true;
+        }
+        const gap = b.start - prevEnd;
+        if (gap >= 20) items.push(/*#__PURE__*/React.createElement("div", {
+          key: "g" + idx,
+          className: "gapdiv"
+        }, "· ", gap >= 60 ? Math.floor(gap / 60) + "h " + (gap % 60 ? gap % 60 + "m" : "") : gap + "m", " open ·"));
       }
-      const gap = b.start - prevEnd;
-      if (gap >= 20) items.push(/*#__PURE__*/React.createElement("div", {
-        key: "g" + idx,
-        className: "gapdiv"
-      }, "· ", gap >= 60 ? Math.floor(gap / 60) + "h " + (gap % 60 ? gap % 60 + "m" : "") : gap + "m", " open ·"));
+      const movable = !ANCHORED[b.cat];
       items.push(/*#__PURE__*/React.createElement("button", {
         key: b.id,
-        className: `blk ${b.done ? "isdone" : ""}`,
+        ref: el => {
+          cardRefs.current[b.id] = el;
+        },
+        className: `blk ${b.done ? "isdone" : ""} ${movable ? "mov" : ""} ${dragId === b.id ? "dragging" : ""}`,
         style: {
           borderLeftColor: CATS[b.cat].color,
           borderStyle: b.cat === "sleep" ? "dashed" : "solid",
           background: b.cat === "sleep" ? "transparent" : undefined
         },
-        onClick: () => setEditing(b.id)
-      }, b.cat === "prayer" && /*#__PURE__*/React.createElement("span", {
+        onClick: () => {
+          if (!dragId) setEditing(b.id);
+        }
+      }, movable && /*#__PURE__*/React.createElement("span", {
+        className: "handle",
+        onClick: e => e.stopPropagation(),
+        onPointerDown: e => {
+          e.preventDefault();
+          e.stopPropagation();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setDragId(b.id);
+        },
+        onPointerMove: dragMove,
+        onPointerUp: dragDrop,
+        onPointerCancel: dragDrop
+      }, "⠿"), b.cat === "prayer" && /*#__PURE__*/React.createElement("span", {
         className: "pdiamond"
       }), b.cat !== "sleep" && /*#__PURE__*/React.createElement("span", {
         role: "checkbox",
@@ -1789,12 +1893,12 @@ function ScheduleView({
         }
       }, b.title), /*#__PURE__*/React.createElement("div", {
         className: "tm"
-      }, fmt(b.start), " – ", fmt(b.end), " · ", b.end - b.start, "m"), b.note ? /*#__PURE__*/React.createElement("div", {
+      }, dragId ? movable ? "will re-time on drop" : fmt(b.start) + " – " + fmt(b.end) : fmt(b.start) + " – " + fmt(b.end) + " · " + (b.end - b.start) + "m"), b.note && !dragId ? /*#__PURE__*/React.createElement("div", {
         className: "nt"
       }, b.note) : null));
       prevEnd = Math.max(prevEnd, b.end);
     });
-    if (!nowPlaced && nm <= dayEnd + 30) items.push(/*#__PURE__*/React.createElement("div", {
+    if (!dragId && !nowPlaced && nm <= dayEnd + 30) items.push(/*#__PURE__*/React.createElement("div", {
       key: "now",
       className: "nowline"
     }, /*#__PURE__*/React.createElement("span", null, fmt(nm))));
