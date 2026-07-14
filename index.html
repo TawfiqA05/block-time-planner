@@ -91,6 +91,51 @@ function icsForPlan(plan) {
   return `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//blocktime//EN\r\n${ev}\r\nEND:VCALENDAR`;
 }
 
+/* ---------- Hijri date (native Intl, no API) ---------- */
+function hijriDate(d) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-u-ca-islamic-umalqura", {
+      day: "numeric",
+      month: "long",
+      year: "numeric"
+    }).formatToParts(d);
+    const get = t => {
+      const p = parts.find(x => x.type === t);
+      return p ? p.value : "";
+    };
+    if (!get("month")) return null;
+    return {
+      text: `${get("day")} ${get("month")} ${get("year")} AH`,
+      month: get("month")
+    };
+  } catch (e) {
+    return null;
+  }
+}
+const WMO = {
+  0: "clear",
+  1: "mostly clear",
+  2: "partly cloudy",
+  3: "overcast",
+  45: "fog",
+  48: "fog",
+  51: "drizzle",
+  53: "drizzle",
+  55: "drizzle",
+  61: "light rain",
+  63: "rain",
+  65: "heavy rain",
+  71: "snow",
+  73: "snow",
+  75: "snow",
+  80: "showers",
+  81: "showers",
+  82: "heavy showers",
+  95: "thunderstorms",
+  96: "thunderstorms",
+  99: "thunderstorms"
+};
+
 /* ---------- drag reflow: keep anchors, re-time movables in new order ---------- */
 const ANCHORED = {
   prayer: true,
@@ -746,7 +791,9 @@ async function aiSchedule(cfg, key, profile) {
     fasting,
     includeQuran,
     jumuah,
-    weekday
+    weekday,
+    weather,
+    backlog
   } = cfg;
   const sleep = cfg.sleep <= wake ? cfg.sleep + 1440 : cfg.sleep;
   const pf = t => t == null ? null : `${String(Math.floor((t % 1440 + 1440) % 1440 / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
@@ -775,7 +822,14 @@ async function aiSchedule(cfg, key, profile) {
     non_negotiable_or_deadline: hardline || "none",
     fasting: !!fasting,
     friday_jumuah_time: jumuah && jumuah.on && weekday === 5 && jumuah.time != null ? pf(jumuah.time) : null,
-    include_quran_block: includeQuran !== false
+    include_quran_block: includeQuran !== false,
+    weather_forecast: weather ? {
+      high_f: weather.tmax,
+      low_f: weather.tmin,
+      rain_chance_pct: weather.precip,
+      conditions: WMO[weather.code] || "unknown"
+    } : null,
+    backlog_open_items: Array.isArray(backlog) ? backlog.slice(0, 15) : []
   };
   const rules = `Plan this person's day hour-by-hour from wake to asleep_by, as their intelligent personal planner.
 HARD RULES:
@@ -792,6 +846,8 @@ HARD RULES:
 11. If fasting is true: NO midday meals at all; schedule Suhoor ending 15m before Fajr when the person is awake for it, and Iftar immediately after Maghrib prayer (note: break with dates + water at adhan, pray, then eat); keep any workout light, ideally in the last hour before Iftar.
 12. If friday_jumuah_time is set: replace Dhuhr with a "Jumu'ah" block from 30m before that time to 60m after it, with a travel/arrive-early note.
 13. If include_quran_block is true: add a 10-15m "Qur'an & dhikr" block after Fajr (or after Maghrib if the morning is packed).
+14. If weather_forecast is provided, factor it into outdoor blocks: high >= 88F means outdoor exercise goes before 10:00 or after 19:00 with a heat/hydration note; rain_chance_pct >= 50 means keep exercise indoors or note an indoor fallback; mention the weather briefly only where it matters.
+15. backlog_open_items is the standing to-do list (title + optional due date). You MUST schedule any item due within 48 hours of the plan date even if not in tasks_free_text. You MAY pull in 1-2 additional backlog items only if the day has clear spare capacity. Leave the rest unscheduled.
 PROFILE OF THE PERSON: ${profile}
 Respond with ONLY valid JSON, no prose: {"blocks":[{"title":string,"category":"prayer|fixed|deep|fitness|meal|rest|task|sleep","start":"HH:MM","end":"HH:MM","note":string}]} using 24-hour times.`;
   const call = async model => {
@@ -887,6 +943,15 @@ function App() {
   const [savedPlan, setSavedPlan] = useState(null);
   const [session, setSession] = useState(null);
   const [history, setHistory] = useState({});
+  const [backlog, setBacklog] = useState([]);
+  const [templates, setTemplates] = useState([]);
+  const [selBacklog, setSelBacklog] = useState({});
+  const [nb, setNb] = useState({
+    title: "",
+    due: ""
+  });
+  const [tplName, setTplName] = useState("");
+  const [weather, setWeather] = useState(null);
   const [returnTo, setReturnTo] = useState("input");
 
   // per-plan state
@@ -921,6 +986,8 @@ function App() {
     const p = await sGet("btp:plan");
     const h = (await sGet("btp:history")) || {};
     setHistory(h);
+    setBacklog((await sGet("btp:backlog")) || []);
+    setTemplates((await sGet("btp:templates")) || []);
     if (r) setRecurring(r);
     const best = h[localKey(new Date())] || p;
     if (best) setSavedPlan(best);
@@ -988,6 +1055,11 @@ function App() {
     const map = {};
     todaysRec.forEach(c => map[c.id] = includedRec[c.id] !== false);
     setIncludedRec(map);
+    const hj = hijriDate(planDate);
+    if (hj && /ramadan/i.test(hj.month)) setQ(prev => ({
+      ...prev,
+      fasting: "yes"
+    }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dateKey, recurring.length]);
   const prayers = useMemo(() => {
@@ -1010,6 +1082,73 @@ function App() {
     if (!prev || !Array.isArray(prev.blocks)) return [];
     return prev.blocks.filter(b => (b.cat === "task" || b.cat === "deep") && !b.done).map(b => b.title.replace(/^Deep work — /, "")).slice(0, 6);
   }, [history, dateKey]);
+
+  // preselect backlog items due within 2 days of the plan date
+  useEffect(() => {
+    const sel = {};
+    const limit = new Date(dateKey + "T12:00");
+    limit.setDate(limit.getDate() + 2);
+    const lk = localKey(limit);
+    backlog.forEach(t => {
+      if (!t.done && t.due && t.due <= lk) sel[t.id] = true;
+    });
+    setSelBacklog(sel);
+  }, [dateKey, backlog]);
+  const persistBacklog = async list => {
+    setBacklog(list);
+    await sSet("btp:backlog", list);
+  };
+  const addBacklogItem = () => {
+    if (!nb.title.trim()) return;
+    persistBacklog([...backlog, {
+      id: uid(),
+      title: nb.title.trim(),
+      due: nb.due || null,
+      done: false
+    }]);
+    setNb({
+      title: "",
+      due: ""
+    });
+  };
+  const persistTemplates = async list => {
+    setTemplates(list);
+    await sSet("btp:templates", list);
+  };
+  const saveTemplate = () => {
+    if (!tplName.trim()) return;
+    persistTemplates([...templates, {
+      id: uid(),
+      name: tplName.trim(),
+      taskText,
+      oneOffs,
+      q
+    }]);
+    setTplName("");
+  };
+  const applyTemplate = tp => {
+    setTaskText(tp.taskText || "");
+    setOneOffs(tp.oneOffs || []);
+    if (tp.q) setQ(prev => ({
+      ...prev,
+      ...tp.q
+    }));
+  };
+
+  // weather for the plan date (Open-Meteo, free, no key)
+  useEffect(() => {
+    if (!settings || !settings.city) return;
+    setWeather(null);
+    fetch(`https://api.open-meteo.com/v1/forecast?latitude=${settings.city.lat}&longitude=${settings.city.lng}&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&start_date=${dateKey}&end_date=${dateKey}&temperature_unit=fahrenheit`).then(r => r.json()).then(d => {
+      const dd = d && d.daily;
+      if (dd && dd.temperature_2m_max && dd.temperature_2m_max.length) setWeather({
+        tmax: Math.round(dd.temperature_2m_max[0]),
+        tmin: Math.round(dd.temperature_2m_min[0]),
+        precip: dd.precipitation_probability_max ? Math.round(dd.precipitation_probability_max[0]) : null,
+        code: dd.weather_code ? dd.weather_code[0] : null
+      });
+    }).catch(() => {});
+  }, [dateKey, settings]);
   const generate = async () => {
     const wake = fromInputVal(q.wake),
       sleep = fromInputVal(q.sleep);
@@ -1026,6 +1165,13 @@ function App() {
       end: f.end <= f.start ? f.end + 1440 : f.end
     }));
     const tasks = taskText.split("\n").map(t => t.trim().replace(/^[-•]\s*/, "")).filter(Boolean);
+    backlog.filter(t => !t.done && selBacklog[t.id]).forEach(t => {
+      if (!tasks.includes(t.title)) tasks.push(t.title);
+    });
+    const backlogRest = backlog.filter(t => !t.done && !selBacklog[t.id]).map(t => ({
+      title: t.title,
+      due: t.due || null
+    }));
     const cfg = {
       wake,
       sleep,
@@ -1048,7 +1194,9 @@ function App() {
       jumuah: {
         on: settings.attendJumuah !== false,
         time: fromInputVal(settings.jumuahTime || "13:30")
-      }
+      },
+      weather,
+      backlog: backlogRest
     };
     if (settings.groqKey && settings.groqKey.trim()) {
       setStep("generating");
@@ -1145,7 +1293,9 @@ function App() {
         jumuah: {
           on: settings.attendJumuah !== false,
           time: fromInputVal(settings.jumuahTime || "13:30")
-        }
+        },
+        weather: null,
+        backlog: []
       }, settings.groqKey.trim(), (settings.aiProfile || "") + " IMPORTANT: this is a MID-DAY REPLAN. The given wake time is the current time; plan only the remainder of the day from there.");
       const np = {
         ...plan,
@@ -1207,6 +1357,10 @@ function App() {
     .handle{position:absolute;left:6px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:16px;padding:8px 6px;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
     .handle:active{cursor:grabbing;color:var(--amber)}
     .blk.dragging{border-color:var(--amber);box-shadow:0 10px 28px rgba(0,0,0,.55);opacity:.97;z-index:20;position:relative}
+    .focusov{position:fixed;inset:0;background:rgba(10,12,20,.97);z-index:80;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+    .focustime{font-family:'Spline Sans Mono',monospace;font-size:72px;font-weight:500;letter-spacing:2px;margin:8px 0 14px}
+    .focusbar{width:100%;max-width:340px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden}
+    .focusbar div{height:100%;background:var(--amber);border-radius:3px;transition:width 1s linear}
     .blk .t{font-weight:700;font-size:13.5px;line-height:1.25}
     .blk .tm{font-family:'Spline Sans Mono',monospace;font-size:10.5px;color:var(--muted)}
     .blk .nt{font-size:11.5px;color:var(--muted);line-height:1.3;margin-top:1px}
@@ -1332,7 +1486,10 @@ function App() {
       weekday: "long",
       month: "long",
       day: "numeric"
-    }), " · ", settings.city.name), savedPlan && /*#__PURE__*/React.createElement("div", {
+    }), (() => {
+      const hj = hijriDate(planDate);
+      return hj ? " · " + hj.text : "";
+    })(), " · ", settings.city.name), savedPlan && /*#__PURE__*/React.createElement("div", {
       className: "pin",
       style: {
         cursor: "pointer"
@@ -1341,13 +1498,20 @@ function App() {
         setPlan(savedPlan);
         setStep("schedule");
       }
-    }, /*#__PURE__*/React.createElement("b", null, "Saved plan"), " from ", savedPlan.dateKey, " — tap to open"), streak > 1 && /*#__PURE__*/React.createElement("div", {
-      className: "mini",
+    }, /*#__PURE__*/React.createElement("b", null, "Saved plan"), " from ", savedPlan.dateKey, " — tap to open"), /*#__PURE__*/React.createElement("div", {
+      className: "row",
       style: {
-        marginBottom: 12,
+        marginBottom: 12
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "mini grow",
+      style: {
         color: "#E3A857"
       }
-    }, "🔥 ", streak, "-day planning streak — keep it alive"), carryover.length > 0 && /*#__PURE__*/React.createElement("div", {
+    }, streak > 1 ? `🔥 ${streak}-day planning streak` : ""), /*#__PURE__*/React.createElement("button", {
+      className: "icnbtn",
+      onClick: () => setStep("stats")
+    }, "📊 Stats")), carryover.length > 0 && /*#__PURE__*/React.createElement("div", {
       className: "card"
     }, /*#__PURE__*/React.createElement("label", {
       className: "fld"
@@ -1439,7 +1603,101 @@ function App() {
       placeholder: "Finish ML homework\nEmail Carlos about M-301\nReview scRNA-seq notes",
       value: taskText,
       onChange: e => setTaskText(e.target.value)
-    })), /*#__PURE__*/React.createElement("button", {
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Backlog — standing to-dos with deadlines (tap to include this day; urgent ones auto-selected)"), backlog.filter(t => !t.done).map(t => /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      key: t.id,
+      style: {
+        marginBottom: 6
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: `chip grow ${selBacklog[t.id] ? "on" : ""}`,
+      style: {
+        textAlign: "left"
+      },
+      onClick: () => setSelBacklog({
+        ...selBacklog,
+        [t.id]: !selBacklog[t.id]
+      })
+    }, t.title, t.due ? " · due " + t.due.slice(5) : ""), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      title: "Mark done",
+      onClick: () => persistBacklog(backlog.map(x => x.id === t.id ? {
+        ...x,
+        done: true
+      } : x))
+    }, "✓"), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      title: "Delete",
+      onClick: () => persistBacklog(backlog.filter(x => x.id !== t.id))
+    }, "✕"))), /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      style: {
+        marginTop: 8
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "text",
+      placeholder: "Add a to-do…",
+      value: nb.title,
+      onChange: e => setNb({
+        ...nb,
+        title: e.target.value
+      }),
+      className: "grow"
+    }), /*#__PURE__*/React.createElement("input", {
+      type: "date",
+      value: nb.due,
+      onChange: e => setNb({
+        ...nb,
+        due: e.target.value
+      }),
+      style: {
+        width: 150
+      }
+    }), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      onClick: addBacklogItem
+    }, "Add")), /*#__PURE__*/React.createElement("div", {
+      className: "mini",
+      style: {
+        marginTop: 6
+      }
+    }, "The AI schedules anything due within 48h automatically, and pulls extras when the day has room.")), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Day templates — save a typical day, reuse it in one tap"), templates.length > 0 && /*#__PURE__*/React.createElement("div", {
+      className: "chiprow",
+      style: {
+        marginBottom: 8
+      }
+    }, templates.map(tp => /*#__PURE__*/React.createElement("span", {
+      key: tp.id,
+      style: {
+        display: "inline-flex",
+        gap: 4
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      onClick: () => applyTemplate(tp)
+    }, tp.name), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      onClick: () => persistTemplates(templates.filter(x => x.id !== tp.id))
+    }, "✕")))), /*#__PURE__*/React.createElement("div", {
+      className: "row"
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "text",
+      placeholder: "Save current setup as… (e.g. Internship day)",
+      value: tplName,
+      onChange: e => setTplName(e.target.value),
+      className: "grow"
+    }), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      onClick: saveTemplate
+    }, "Save"))), /*#__PURE__*/React.createElement("button", {
       className: "btn",
       onClick: () => setStep("questions")
     }, "Next — a few quick questions")));
@@ -1472,7 +1730,14 @@ function App() {
     }, [["Fajr", prayers.fajr], ["Dhuhr", prayers.dhuhr], ["Asr", prayers.asr], ["Maghrib", prayers.maghrib], ["Isha", prayers.isha]].map(([n, t]) => /*#__PURE__*/React.createElement("span", {
       className: "ptag",
       key: n
-    }, n, " ", fmt(t)))), /*#__PURE__*/React.createElement("div", {
+    }, n, " ", fmt(t))), weather && /*#__PURE__*/React.createElement("span", {
+      className: "ptag",
+      style: {
+        borderColor: "rgba(143,183,232,.45)",
+        color: "#8FB7E8",
+        background: "rgba(143,183,232,.08)"
+      }
+    }, weather.tmax, "° / ", weather.tmin, "°", weather.code != null && WMO[weather.code] ? " · " + WMO[weather.code] : "", weather.precip != null ? " · " + weather.precip + "% rain" : "")), /*#__PURE__*/React.createElement("div", {
       className: "card"
     }, /*#__PURE__*/React.createElement("label", {
       className: "fld"
@@ -1609,6 +1874,122 @@ function App() {
   }
 
   /* ============ STEP 3 — SCHEDULE ============ */
+  if (step === "stats") {
+    const days = [];
+    const d = new Date();
+    for (let i = 6; i >= 0; i--) {
+      const dd = new Date(d);
+      dd.setDate(dd.getDate() - i);
+      const k = localKey(dd);
+      const p = history[k];
+      const nb2 = p && Array.isArray(p.blocks) ? p.blocks.filter(b => b.cat !== "sleep") : [];
+      days.push({
+        key: k,
+        label: DAYS[dd.getDay()],
+        planned: nb2.length,
+        done: nb2.filter(b => b.done).length,
+        deep: nb2.filter(b => b.cat === "deep").reduce((s, b) => s + (b.end - b.start), 0),
+        fit: nb2.filter(b => b.cat === "fitness").reduce((s, b) => s + (b.end - b.start), 0),
+        mood: p && p.review ? p.review.mood : null
+      });
+    }
+    const tot = f => days.reduce((s, x) => s + f(x), 0);
+    const plannedDays = days.filter(x => x.planned > 0).length;
+    const compl = tot(x => x.planned) ? Math.round(tot(x => x.done) / tot(x => x.planned) * 100) : 0;
+    return /*#__PURE__*/React.createElement("div", {
+      className: "btp"
+    }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+      className: "wrap"
+    }, /*#__PURE__*/React.createElement(Header, {
+      back: true,
+      onBack: () => setStep("input")
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "eyebrow"
+    }, "Last 7 days"), /*#__PURE__*/React.createElement("h2", null, "Your week in blocks"), /*#__PURE__*/React.createElement("div", {
+      className: "sub"
+    }, "Streak: ", streak, " day", streak === 1 ? "" : "s", " · ", plannedDays, "/7 days planned"), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      style: {
+        justifyContent: "space-between",
+        textAlign: "center"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 22,
+        fontWeight: 700,
+        color: "#B49AD6"
+      }
+    }, compl, "%"), /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, "blocks done")), /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 22,
+        fontWeight: 700,
+        color: "#8FA7E8"
+      }
+    }, Math.round(tot(x => x.deep) / 6) / 10, "h"), /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, "deep work")), /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 22,
+        fontWeight: 700,
+        color: "#7FC08B"
+      }
+    }, Math.round(tot(x => x.fit) / 6) / 10, "h"), /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, "fitness")))), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Completion by day"), /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      style: {
+        alignItems: "flex-end",
+        height: 110,
+        gap: 10
+      }
+    }, days.map(x => {
+      const pct = x.planned ? Math.round(x.done / x.planned * 100) : 0;
+      return /*#__PURE__*/React.createElement("div", {
+        key: x.key,
+        className: "grow",
+        style: {
+          textAlign: "center"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          height: 80,
+          display: "flex",
+          alignItems: "flex-end",
+          justifyContent: "center"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          width: "70%",
+          height: Math.max(4, pct * 0.8),
+          background: x.planned ? "rgba(227,168,87,.85)" : "#2C3245",
+          borderRadius: 4
+        }
+      })), /*#__PURE__*/React.createElement("div", {
+        className: "mini",
+        style: {
+          marginTop: 4
+        }
+      }, x.label), /*#__PURE__*/React.createElement("div", {
+        className: "mini"
+      }, x.mood === "good" ? "🙂" : x.mood === "ok" ? "😐" : x.mood === "rough" ? "😮‍💨" : x.planned ? pct + "%" : "–"));
+    }))), /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, "Deep-work and fitness totals count planned blocks; the bars show what you actually checked off. Reviews you log each evening show as faces.")));
+  }
   if (step === "schedule" && plan) {
     return /*#__PURE__*/React.createElement(ScheduleView, {
       css: css,
@@ -1654,6 +2035,42 @@ function ScheduleView({
   const [dragId, setDragId] = useState(null);
   const [previewIds, setPreviewIds] = useState(null);
   const cardRefs = useRef({});
+  const [focus, setFocus] = useState(null); // {id,title,note,total,remain,paused}
+  const wakeLockRef = useRef(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [rMood, setRMood] = useState(plan.review ? plan.review.mood : null);
+  const [rNote, setRNote] = useState(plan.review ? plan.review.note || "" : "");
+  useEffect(() => {
+    if (!focus || focus.paused || focus.remain <= 0) return;
+    const i = setInterval(() => setFocus(f => f && !f.paused && f.remain > 0 ? {
+      ...f,
+      remain: f.remain - 1
+    } : f), 1000);
+    return () => clearInterval(i);
+  }, [focus && focus.paused, focus && focus.id]);
+  const startFocus = async b => {
+    setFocus({
+      id: b.id,
+      title: b.title,
+      note: b.note || "",
+      total: (b.end - b.start) * 60,
+      remain: (b.end - b.start) * 60,
+      paused: false
+    });
+    try {
+      if (navigator.wakeLock) wakeLockRef.current = await navigator.wakeLock.request("screen");
+    } catch (e) {}
+  };
+  const closeFocus = () => {
+    try {
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release();
+        wakeLockRef.current = null;
+      }
+    } catch (e) {}
+    setFocus(null);
+  };
+  const fmts = s => `${Math.floor(Math.max(0, s) / 60)}:${pad(Math.max(0, s) % 60)}`;
   const PPM = 1.15; // px per minute
   const {
     blocks,
@@ -1780,14 +2197,26 @@ function ScheduleView({
     weekday: "long",
     month: "long",
     day: "numeric"
-  })), /*#__PURE__*/React.createElement("div", {
+  }), (() => {
+    const hj = hijriDate(new Date(plan.dateKey + "T12:00"));
+    return hj ? " · " + hj.text : "";
+  })()), /*#__PURE__*/React.createElement("div", {
     className: "sub"
   }, fmt(dayStart), " wake → ", fmt(dayEnd - 30), " asleep · prayers anchored · ", plan.ai ? "planned by AI" : "rule-based plan"), /*#__PURE__*/React.createElement("div", {
     className: "ptimes",
     style: {
       marginBottom: 12
     }
-  }, nextPrayer && /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "ptag",
+    style: {
+      borderColor: "rgba(180,154,214,.45)",
+      color: "#B49AD6",
+      background: "rgba(180,154,214,.08)",
+      cursor: "pointer"
+    },
+    onClick: () => setReviewOpen(true)
+  }, "☾ Review", plan.review ? " ✓" : ""), nextPrayer && /*#__PURE__*/React.createElement("span", {
     className: "ptag"
   }, nextPrayer.title, " in ", npMins >= 60 ? Math.floor(npMins / 60) + "h " : "", npMins % 60, "m"), /*#__PURE__*/React.createElement("span", {
     className: "ptag",
@@ -2038,7 +2467,16 @@ function ScheduleView({
     style: {
       marginBottom: 12
     }
-  }), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost",
+    style: {
+      marginBottom: 10
+    },
+    onClick: () => {
+      startFocus(eb);
+      setEditing(null);
+    }
+  }, "▶ Start focus timer · ", eb.end - eb.start, " min"), /*#__PURE__*/React.createElement("div", {
     className: "row"
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn ghost del grow",
@@ -2046,7 +2484,130 @@ function ScheduleView({
   }, "Delete"), /*#__PURE__*/React.createElement("button", {
     className: "btn grow",
     onClick: () => setEditing(null)
-  }, "Done")))));
+  }, "Done")))), focus && /*#__PURE__*/React.createElement("div", {
+    className: "focusov"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "eyebrow",
+    style: {
+      marginBottom: 6
+    }
+  }, focus.remain <= 0 ? "Time — well done" : focus.paused ? "Paused" : "Focused on"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "'Instrument Serif',serif",
+      fontSize: 26,
+      marginBottom: 4,
+      textAlign: "center",
+      padding: "0 24px"
+    }
+  }, focus.title), focus.note ? /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginBottom: 14,
+      textAlign: "center",
+      padding: "0 30px"
+    }
+  }, focus.note) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 14
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "focustime",
+    style: {
+      color: focus.remain <= 0 ? "#7FC08B" : "var(--amber)"
+    }
+  }, fmts(focus.remain)), /*#__PURE__*/React.createElement("div", {
+    className: "focusbar"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: `${Math.max(0, Math.min(100, (1 - focus.remain / focus.total) * 100))}%`
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "row",
+    style: {
+      marginTop: 22,
+      width: "100%",
+      maxWidth: 340
+    }
+  }, focus.remain > 0 && /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: () => setFocus({
+      ...focus,
+      paused: !focus.paused
+    })
+  }, focus.paused ? "Resume" : "Pause"), focus.remain > 0 && /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: () => setFocus({
+      ...focus,
+      remain: focus.remain + 300,
+      total: focus.total + 300
+    })
+  }, "+5 min")), /*#__PURE__*/React.createElement("div", {
+    className: "row",
+    style: {
+      marginTop: 8,
+      width: "100%",
+      maxWidth: 340
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: closeFocus
+  }, "Close"), /*#__PURE__*/React.createElement("button", {
+    className: "btn grow",
+    onClick: () => {
+      const id = focus.id;
+      closeFocus();
+      const b = blocks.find(x => x.id === id);
+      if (b && !b.done) toggleDone(id);
+    }
+  }, "✓ Mark done")), /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginTop: 16
+    }
+  }, "Screen stays awake while the timer runs (when supported).")), reviewOpen && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "scrim",
+    onClick: () => setReviewOpen(false)
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "sheet"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "End-of-day review · ", doneCount, "/", blocks.filter(b => b.cat !== "sleep").length, " blocks done"), /*#__PURE__*/React.createElement("div", {
+    className: "chiprow",
+    style: {
+      margin: "8px 0 12px"
+    }
+  }, [["good", "🙂 Good day"], ["ok", "😐 It was fine"], ["rough", "😮‍💨 Rough one"]].map(([v, l]) => /*#__PURE__*/React.createElement("button", {
+    key: v,
+    className: `chip ${rMood === v ? "on" : ""}`,
+    onClick: () => setRMood(v)
+  }, l))), /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "One line for tomorrow-you (optional)"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: rNote,
+    onChange: e => setRNote(e.target.value),
+    placeholder: "What worked? What would you change?",
+    style: {
+      marginBottom: 12
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: () => setReviewOpen(false)
+  }, "Cancel"), /*#__PURE__*/React.createElement("button", {
+    className: "btn grow",
+    onClick: () => {
+      onAutoSave({
+        ...plan,
+        review: {
+          mood: rMood,
+          note: rNote.trim()
+        }
+      });
+      setReviewOpen(false);
+    }
+  }, "Save review")))));
 }
 
 /* ============================================================
