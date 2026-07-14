@@ -1510,6 +1510,9 @@ function App() {
       }
     }, streak > 1 ? `🔥 ${streak}-day planning streak` : ""), /*#__PURE__*/React.createElement("button", {
       className: "icnbtn",
+      onClick: () => setStep("history")
+    }, "🗓 History"), /*#__PURE__*/React.createElement("button", {
+      className: "icnbtn",
       onClick: () => setStep("stats")
     }, "📊 Stats")), carryover.length > 0 && /*#__PURE__*/React.createElement("div", {
       className: "card"
@@ -1874,6 +1877,79 @@ function App() {
   }
 
   /* ============ STEP 3 — SCHEDULE ============ */
+  if (step === "history") {
+    const keys = Object.keys(history).sort().reverse();
+    return /*#__PURE__*/React.createElement("div", {
+      className: "btp"
+    }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+      className: "wrap"
+    }, /*#__PURE__*/React.createElement(Header, {
+      back: true,
+      onBack: () => setStep("input")
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "eyebrow"
+    }, keys.length, " saved day", keys.length === 1 ? "" : "s", " · tap one to open & edit"), /*#__PURE__*/React.createElement("h2", null, "History"), /*#__PURE__*/React.createElement("div", {
+      className: "sub"
+    }, "Every saved plan lives here. Open a day to review it, check things off late, fix times, or add what actually happened — edits save back to that date."), keys.length === 0 && /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, "Nothing here yet — days appear once you hit Save on a plan.")), keys.map(k => {
+      const p = history[k];
+      const nb2 = (p && Array.isArray(p.blocks) ? p.blocks : []).filter(b => b.cat !== "sleep");
+      const done = nb2.filter(b => b.done).length;
+      const deep = nb2.filter(b => b.cat === "deep").reduce((s, b) => s + (b.end - b.start), 0);
+      const d = new Date(k + "T12:00");
+      const mood = p && p.review ? p.review.mood === "good" ? "🙂" : p.review.mood === "ok" ? "😐" : "😮‍💨" : null;
+      return /*#__PURE__*/React.createElement("div", {
+        className: "card",
+        key: k,
+        style: {
+          cursor: "pointer"
+        },
+        onClick: () => {
+          setPlan(p);
+          setStep("schedule");
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "row"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "grow"
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontWeight: 700
+        }
+      }, d.toLocaleDateString(undefined, {
+        weekday: "long",
+        month: "long",
+        day: "numeric"
+      }), k === localKey(new Date()) ? " · today" : ""), /*#__PURE__*/React.createElement("div", {
+        className: "mini",
+        style: {
+          marginTop: 2
+        }
+      }, done, "/", nb2.length, " done · ", Math.round(deep / 6) / 10, "h deep", p.ai ? " · AI-planned" : "", mood ? " · " + mood : ""), p && p.review && p.review.note ? /*#__PURE__*/React.createElement("div", {
+        className: "mini",
+        style: {
+          marginTop: 2,
+          fontStyle: "italic"
+        }
+      }, "\"", p.review.note, "\"") : null), /*#__PURE__*/React.createElement("button", {
+        className: "chip",
+        onClick: e => {
+          e.stopPropagation();
+          if (window.confirm("Delete the plan for " + k + "? This can't be undone.")) {
+            const h = {
+              ...history
+            };
+            delete h[k];
+            setHistory(h);
+            sSet("btp:history", h);
+          }
+        }
+      }, "✕")));
+    })));
+  }
   if (step === "stats") {
     const days = [];
     const d = new Date();
