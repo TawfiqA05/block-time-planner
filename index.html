@@ -1313,7 +1313,7 @@ function App() {
     :root{ --bg:#12141C; --surface:#1B1F2B; --surface2:#232838; --line:#2C3245; --ink:#ECE9E1; --muted:#8A8FA3; --amber:#E3A857; }
     *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
     .btp{min-height:100vh;background:var(--bg);color:var(--ink);font-family:'Karla',system-ui,sans-serif;font-size:15px;line-height:1.45}
-    .wrap{max-width:520px;margin:0 auto;padding:20px 16px 190px}
+    .wrap{max-width:520px;margin:0 auto;padding:calc(16px + env(safe-area-inset-top, 0px)) 16px calc(190px + env(safe-area-inset-bottom, 0px))}
     .brand{font-family:'Instrument Serif',serif;font-size:26px;letter-spacing:.2px}
     .brand em{color:var(--amber);font-style:normal}
     .eyebrow{font-family:'Spline Sans Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
@@ -1357,7 +1357,7 @@ function App() {
     .handle{position:absolute;left:6px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:16px;padding:8px 6px;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
     .handle:active{cursor:grabbing;color:var(--amber)}
     .blk.dragging{border-color:var(--amber);box-shadow:0 10px 28px rgba(0,0,0,.55);opacity:.97;z-index:20;position:relative}
-    .focusov{position:fixed;inset:0;background:rgba(10,12,20,.97);z-index:80;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+    .focusov{position:fixed;inset:0;background:rgba(10,12,20,.97);z-index:80;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:calc(20px + env(safe-area-inset-top, 0px)) 20px calc(20px + env(safe-area-inset-bottom, 0px))}
     .focustime{font-family:'Spline Sans Mono',monospace;font-size:72px;font-weight:500;letter-spacing:2px;margin:8px 0 14px}
     .focusbar{width:100%;max-width:340px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden}
     .focusbar div{height:100%;background:var(--amber);border-radius:3px;transition:width 1s linear}
@@ -1365,12 +1365,12 @@ function App() {
     .blk .tm{font-family:'Spline Sans Mono',monospace;font-size:10.5px;color:var(--muted)}
     .blk .nt{font-size:11.5px;color:var(--muted);line-height:1.3;margin-top:1px}
     .anchor{position:absolute;left:-24px;width:10px;height:10px;background:var(--amber);transform:rotate(45deg) translateY(-4px);border-radius:2px;box-shadow:0 0 8px rgba(227,168,87,.5)}
-    .sheet{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);border-radius:18px 18px 0 0;padding:18px 16px 26px;max-width:520px;margin:0 auto;z-index:50;box-shadow:0 -12px 40px rgba(0,0,0,.5)}
+    .sheet{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);border-radius:18px 18px 0 0;padding:18px 16px calc(24px + env(safe-area-inset-bottom, 0px));max-width:520px;margin:0 auto;z-index:50;box-shadow:0 -12px 40px rgba(0,0,0,.5)}
     .scrim{position:fixed;inset:0;background:rgba(6,8,14,.6);z-index:40}
     .pin{background:rgba(227,168,87,.1);border:1px solid rgba(227,168,87,.35);border-radius:12px;padding:10px 12px;font-size:13.5px;margin-bottom:12px}
     .pin b{color:var(--amber)}
-    .fab{position:fixed;bottom:18px;right:16px;z-index:30;background:var(--amber);color:#1a1408;border:none;border-radius:999px;width:52px;height:52px;font-size:26px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45)}
-    .barbtns{position:fixed;bottom:0;left:0;right:0;background:linear-gradient(transparent, var(--bg) 40%);padding:24px 16px 16px;max-width:520px;margin:0 auto}
+    .fab{position:fixed;bottom:calc(16px + env(safe-area-inset-bottom, 0px));right:16px;z-index:30;background:var(--amber);color:#1a1408;border:none;border-radius:999px;width:52px;height:52px;font-size:26px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+    .barbtns{position:fixed;bottom:0;left:0;right:0;background:linear-gradient(transparent, var(--bg) 40%);padding:24px 16px calc(14px + env(safe-area-inset-bottom, 0px));max-width:520px;margin:0 auto}
     .del{background:rgba(224,110,110,.12);border:1px solid rgba(224,110,110,.4);color:#e08a7a}
     .flash{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:var(--surface2);border:1px solid var(--amber);color:var(--amber);padding:8px 16px;border-radius:999px;font-size:13px;z-index:60}
     .reclist .row{padding:8px 0;border-bottom:1px solid var(--line)}
