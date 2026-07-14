@@ -1,0 +1,2494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#12141C" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="block·time" />
+<title>block·time — daily planner</title>
+<style>html,body{margin:0;background:#12141C}</style>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const {
+  useState,
+  useEffect,
+  useMemo,
+  useRef
+} = React;
+
+/* ============================================================
+   SUPABASE CONFIG — paste your two values between the quotes.
+   (Project URL and "anon public" key, from Supabase → Settings → API)
+   The anon key is safe to have in this file: row-level security
+   means each account can only ever read/write its own rows.
+   ============================================================ */
+const SUPABASE_URL = "PASTE_YOUR_PROJECT_URL_HERE";
+const SUPABASE_ANON_KEY = "PASTE_YOUR_ANON_KEY_HERE";
+function getConfig() {
+  if (SUPABASE_URL.startsWith("https://")) return {
+    url: SUPABASE_URL,
+    key: SUPABASE_ANON_KEY
+  };
+  try {
+    const c = JSON.parse(localStorage.getItem("btp:config"));
+    if (c && c.url) return c;
+  } catch {}
+  return null;
+}
+let _sb = null;
+function getClient() {
+  const c = getConfig();
+  if (!c) return null;
+  if (!_sb) _sb = window.supabase.createClient(c.url, c.key);
+  return _sb;
+}
+
+/* ============================================================
+   BLOCK-TIME PLANNER — nightly day planner built around the
+   five daily prayers. Dark, calm, phone-first.
+   ============================================================ */
+
+/* ---------- time helpers (minutes since midnight of plan day) ---------- */
+const pad = n => String(n).padStart(2, "0");
+const fmt = min => {
+  const m = (Math.round(min) % 1440 + 1440) % 1440;
+  let h = Math.floor(m / 60),
+    mm = m % 60;
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 === 0 ? 12 : h % 12;
+  return `${h}:${pad(mm)} ${ap}`;
+};
+const toInputVal = min => {
+  const m = (Math.round(min) % 1440 + 1440) % 1440;
+  return `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+};
+const fromInputVal = s => {
+  if (!s) return null;
+  const [h, m] = s.split(":").map(Number);
+  return h * 60 + m;
+};
+const localKey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+function icsForPlan(plan) {
+  const d0 = plan.dateKey.replace(/-/g, "");
+  const nd = new Date(plan.dateKey + "T12:00");
+  nd.setDate(nd.getDate() + 1);
+  const d1 = localKey(nd).replace(/-/g, "");
+  const t = min => {
+    const day = min >= 1440 ? d1 : d0;
+    const m = (Math.round(min) % 1440 + 1440) % 1440;
+    return `${day}T${pad(Math.floor(m / 60))}${pad(m % 60)}00`;
+  };
+  const esc = s => String(s || "").replace(/[,;]/g, " ");
+  const ev = plan.blocks.filter(b => b.cat !== "sleep").map((b, i) => `BEGIN:VEVENT\r\nUID:btp-${plan.dateKey}-${i}@blocktime\r\nDTSTART:${t(b.start)}\r\nDTEND:${t(b.end)}\r\nSUMMARY:${esc(b.title)}\r\nDESCRIPTION:${esc(b.note)}\r\nEND:VEVENT`).join("\r\n");
+  return `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//blocktime//EN\r\n${ev}\r\nEND:VCALENDAR`;
+}
+
+/* ---------- prayer time calculation (solar, no network) ---------- */
+const METHODS = {
+  ISNA: {
+    fajr: 15,
+    isha: 15,
+    label: "ISNA (15° / 15°)"
+  },
+  MWL: {
+    fajr: 18,
+    isha: 17,
+    label: "Muslim World League (18° / 17°)"
+  }
+};
+function computePrayerTimes(dateObj, lat, lng, methodKey, asrFactor) {
+  const rad = Math.PI / 180;
+  const method = METHODS[methodKey] || METHODS.ISNA;
+  const tz = -new Date(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate(), 12).getTimezoneOffset() / 60;
+  const y = dateObj.getFullYear(),
+    mo = dateObj.getMonth() + 1,
+    d = dateObj.getDate();
+  const a = Math.floor((14 - mo) / 12),
+    yy = y + 4800 - a,
+    mm = mo + 12 * a - 3;
+  const jdn = d + Math.floor((153 * mm + 2) / 5) + 365 * yy + Math.floor(yy / 4) - Math.floor(yy / 100) + Math.floor(yy / 400) - 32045;
+  const D = jdn - 2451545.0;
+  const g = ((357.529 + 0.98560028 * D) % 360 + 360) % 360;
+  const q = ((280.459 + 0.98564736 * D) % 360 + 360) % 360;
+  const L = ((q + 1.915 * Math.sin(g * rad) + 0.02 * Math.sin(2 * g * rad)) % 360 + 360) % 360;
+  const e = 23.439 - 0.00000036 * D;
+  let RA = Math.atan2(Math.cos(e * rad) * Math.sin(L * rad), Math.cos(L * rad)) / rad / 15;
+  RA = (RA % 24 + 24) % 24;
+  const decl = Math.asin(Math.sin(e * rad) * Math.sin(L * rad)) / rad;
+  let eqt = q / 15 - RA;
+  eqt = eqt - 24 * Math.round(eqt / 24);
+  const dhuhr = 12 + tz - lng / 15 - eqt;
+  const hourAngle = angle => {
+    const cosH = (-Math.sin(angle * rad) - Math.sin(lat * rad) * Math.sin(decl * rad)) / (Math.cos(lat * rad) * Math.cos(decl * rad));
+    if (cosH < -1 || cosH > 1) return null;
+    return Math.acos(cosH) / rad / 15;
+  };
+  const asrAngle = -Math.atan(1 / (asrFactor + Math.tan(Math.abs(lat - decl) * rad))) / rad;
+  const tF = hourAngle(method.fajr),
+    tR = hourAngle(0.833),
+    tI = hourAngle(method.isha);
+  const tA = hourAngle(asrAngle);
+  const toMin = h => h == null ? null : Math.round((h % 24 + 24) % 24 * 60);
+  return {
+    fajr: toMin(tF != null ? dhuhr - tF : dhuhr - 1.5),
+    sunrise: toMin(tR != null ? dhuhr - tR : dhuhr - 1),
+    dhuhr: toMin(dhuhr + 2 / 60),
+    asr: toMin(tA != null ? dhuhr + tA : dhuhr + 4),
+    maghrib: toMin(tR != null ? dhuhr + tR : dhuhr + 1),
+    isha: toMin(tI != null ? dhuhr + tI : dhuhr + 1.5)
+  };
+}
+
+/* ---------- persistent storage ---------- */
+async function sGet(key) {
+  const client = getClient();
+  if (client) {
+    try {
+      const {
+        data: {
+          user
+        }
+      } = await client.auth.getUser();
+      if (user) {
+        const {
+          data,
+          error
+        } = await client.from("kv").select("value").eq("user_id", user.id).eq("key", key).maybeSingle();
+        if (!error) {
+          if (data) {
+            try {
+              localStorage.setItem(key, JSON.stringify(data.value));
+            } catch {}
+            return data.value;
+          }
+          return null;
+        }
+      }
+    } catch (e) {
+      console.error("cloud read failed — using this device's copy", e);
+    }
+  }
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+async function sSet(key, val) {
+  try {
+    localStorage.setItem(key, JSON.stringify(val));
+  } catch {}
+  const client = getClient();
+  if (client) {
+    try {
+      const {
+        data: {
+          user
+        }
+      } = await client.auth.getUser();
+      if (user) {
+        const {
+          error
+        } = await client.from("kv").upsert({
+          user_id: user.id,
+          key,
+          value: val,
+          updated_at: new Date().toISOString()
+        });
+        if (error) console.error("cloud save failed (saved on this device)", error.message);
+      }
+    } catch (e) {
+      console.error("cloud save failed (saved on this device)", e);
+    }
+  }
+}
+
+/* ---------- constants ---------- */
+const CITIES = [{
+  name: "Indianapolis, IN",
+  lat: 39.768,
+  lng: -86.158
+}, {
+  name: "Fishers, IN",
+  lat: 39.957,
+  lng: -86.014
+}, {
+  name: "Carmel, IN",
+  lat: 39.978,
+  lng: -86.118
+}, {
+  name: "Chicago, IL",
+  lat: 41.878,
+  lng: -87.63
+}, {
+  name: "New York, NY",
+  lat: 40.713,
+  lng: -74.006
+}, {
+  name: "Los Angeles, CA",
+  lat: 34.052,
+  lng: -118.244
+}, {
+  name: "Houston, TX",
+  lat: 29.76,
+  lng: -95.37
+}, {
+  name: "Dallas, TX",
+  lat: 32.777,
+  lng: -96.797
+}, {
+  name: "Dearborn, MI",
+  lat: 42.322,
+  lng: -83.176
+}, {
+  name: "Columbus, OH",
+  lat: 39.961,
+  lng: -82.999
+}, {
+  name: "Phoenix, AZ",
+  lat: 33.448,
+  lng: -112.074
+}, {
+  name: "Philadelphia, PA",
+  lat: 39.953,
+  lng: -75.164
+}, {
+  name: "Atlanta, GA",
+  lat: 33.749,
+  lng: -84.388
+}, {
+  name: "Minneapolis, MN",
+  lat: 44.978,
+  lng: -93.265
+}, {
+  name: "Seattle, WA",
+  lat: 47.606,
+  lng: -122.332
+}, {
+  name: "Denver, CO",
+  lat: 39.739,
+  lng: -104.99
+}, {
+  name: "Boston, MA",
+  lat: 42.36,
+  lng: -71.059
+}, {
+  name: "Washington, DC",
+  lat: 38.907,
+  lng: -77.037
+}, {
+  name: "Miami, FL",
+  lat: 25.762,
+  lng: -80.192
+}, {
+  name: "San Jose, CA",
+  lat: 37.338,
+  lng: -121.886
+}, {
+  name: "Toronto, ON",
+  lat: 43.653,
+  lng: -79.383
+}, {
+  name: "London, UK",
+  lat: 51.507,
+  lng: -0.128
+}, {
+  name: "Dubai, UAE",
+  lat: 25.205,
+  lng: 55.271
+}, {
+  name: "Riyadh, KSA",
+  lat: 24.713,
+  lng: 46.675
+}, {
+  name: "Amman, JO",
+  lat: 31.955,
+  lng: 35.945
+}, {
+  name: "Cairo, EG",
+  lat: 30.044,
+  lng: 31.236
+}, {
+  name: "Istanbul, TR",
+  lat: 41.008,
+  lng: 28.978
+}, {
+  name: "Kuala Lumpur, MY",
+  lat: 3.139,
+  lng: 101.687
+}];
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const CATS = {
+  prayer: {
+    color: "#E3A857",
+    label: "Prayer"
+  },
+  fixed: {
+    color: "#97A0B5",
+    label: "Commitment"
+  },
+  deep: {
+    color: "#8FA7E8",
+    label: "Deep work"
+  },
+  fitness: {
+    color: "#7FC08B",
+    label: "Fitness"
+  },
+  meal: {
+    color: "#E08A7A",
+    label: "Meal"
+  },
+  rest: {
+    color: "#B49AD6",
+    label: "Rest"
+  },
+  task: {
+    color: "#6FB8B8",
+    label: "Task"
+  },
+  sleep: {
+    color: "#5E6480",
+    label: "Sleep"
+  }
+};
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+/* ---------- the scheduler ---------- */
+function buildSchedule(cfg) {
+  const {
+    wake,
+    prayers,
+    fixed,
+    tasks,
+    energy,
+    workout,
+    mealsCount,
+    fasting,
+    includeQuran,
+    jumuah,
+    weekday
+  } = cfg;
+  let sleep = cfg.sleep <= wake ? cfg.sleep + 1440 : cfg.sleep;
+  const blocks = [];
+  const occ = []; // padded occupied intervals
+
+  const overlaps = (s, e) => occ.some(o => s < o.e && e > o.s);
+  const inDay = (s, e) => s >= wake && e <= sleep;
+  const fit = (dur, winS, winE, validate, backward = false) => {
+    winS = Math.max(winS, wake);
+    winE = Math.min(winE, sleep);
+    if (winE - winS < dur) return null;
+    const starts = [];
+    for (let t = winS; t + dur <= winE; t += 5) starts.push(t);
+    if (backward) starts.reverse();
+    for (const t of starts) {
+      if (!overlaps(t - 5, t + dur + 5) && (!validate || validate(t, t + dur))) return t;
+    }
+    // relax padding if nothing fit
+    for (const t of starts) {
+      if (!overlaps(t, t + dur) && (!validate || validate(t, t + dur))) return t;
+    }
+    return null;
+  };
+  const place = (b, pad = 5) => {
+    blocks.push({
+      id: uid(),
+      ...b
+    });
+    occ.push({
+      s: b.start - (b.cat === "prayer" ? 0 : pad),
+      e: b.end + pad
+    });
+  };
+
+  /* 1 — prayers: unhurried anchors with wudu buffer built in */
+  const P = prayers;
+  // Fajr
+  if (P.fajr != null) {
+    if (wake <= P.fajr) {
+      place({
+        title: "Fajr",
+        cat: "prayer",
+        start: Math.max(wake, P.fajr - 10),
+        end: P.fajr + 25,
+        note: "Wudu buffer built in — no rush"
+      });
+    } else if (wake < P.sunrise) {
+      place({
+        title: "Fajr",
+        cat: "prayer",
+        start: wake,
+        end: wake + 25,
+        note: `Pray on waking — sunrise at ${fmt(P.sunrise)}`
+      });
+    }
+  }
+  const isJumuah = jumuah && jumuah.on && weekday === 5 && jumuah.time != null;
+  for (const [name, t] of [[isJumuah ? "Jumu'ah" : "Dhuhr", isJumuah ? jumuah.time : P.dhuhr], ["Asr", P.asr], ["Maghrib", P.maghrib], ["Isha", P.isha]]) {
+    if (t == null) continue;
+    let tt = t < wake ? t + 1440 : t;
+    if (tt >= wake && tt <= sleep + 30) {
+      const pre = name === "Jumu'ah" ? 30 : 10;
+      const end = tt + (name === "Jumu'ah" ? 60 : 25);
+      if (end > sleep) sleep = end + 10; // Isha runs late — sleep moves, prayer doesn't
+      place({
+        title: name,
+        cat: "prayer",
+        start: tt - pre,
+        end,
+        note: name === "Jumu'ah" ? "Leave early — arrive before the khutbah" : "10 min wudu buffer before adhan"
+      });
+    }
+  }
+
+  /* 2 — fixed commitments, split around prayers if they collide */
+  const prayerBlocks = blocks.filter(b => b.cat === "prayer");
+  for (const f of fixed) {
+    let segs = [[f.start <= wake && f.end <= wake ? f.start + 1440 : f.start, f.end <= f.start ? f.end + 1440 : f.end]];
+    for (const p of prayerBlocks) {
+      segs = segs.flatMap(([s, e]) => {
+        if (s < p.end && e > p.start) {
+          const out = [];
+          if (p.start - s >= 10) out.push([s, p.start]);
+          if (e - p.end >= 10) out.push([p.end, e]);
+          return out;
+        }
+        return [[s, e]];
+      });
+    }
+    segs.forEach(([s, e], i) => {
+      place({
+        title: f.title,
+        cat: "fixed",
+        start: s,
+        end: e,
+        note: segs.length > 1 ? i === 0 ? "Step away to pray, then resume" : "Resumes after prayer" : f.note || ""
+      }, 0);
+    });
+  }
+
+  /* helper anchors */
+  const pB = name => blocks.find(b => b.cat === "prayer" && b.title === name);
+  const fajrEnd = pB("Fajr")?.end ?? wake;
+  const dhuhrB = pB("Dhuhr") || pB("Jumu'ah"),
+    asrB = pB("Asr"),
+    maghribB = pB("Maghrib"),
+    ishaB = pB("Isha");
+
+  /* 3 — meals (fasting-aware, anchored to prayers, never rushed) */
+  const meals = [];
+  const dinnerCap = sleep - 150; // keep dinner >=2.5h before sleep
+  if (fasting) {
+    if (P.fajr != null && wake <= P.fajr - 25) {
+      const s = Math.max(wake, P.fajr - 55);
+      place({
+        title: "Suhoor",
+        cat: "meal",
+        start: s,
+        end: P.fajr - 15,
+        note: "Eat well + hydrate — ends before Fajr"
+      });
+      meals.push([s, P.fajr - 15]);
+    }
+    if (maghribB) {
+      place({
+        title: "Iftar",
+        cat: "meal",
+        start: maghribB.end,
+        end: maghribB.end + 40,
+        note: "Break with dates + water at adhan, pray, then eat"
+      });
+      meals.push([maghribB.end, maghribB.end + 40]);
+    }
+  } else {
+    const mealSlots = [];
+    if (mealsCount >= 3) mealSlots.push({
+      title: "Breakfast",
+      dur: 25,
+      win: [fajrEnd, fajrEnd + 150],
+      note: "Whole foods + water first"
+    });
+    if (dhuhrB) mealSlots.push({
+      title: "Lunch",
+      dur: 35,
+      win: [dhuhrB.end, dhuhrB.end + 100],
+      alt: [dhuhrB.start - 120, dhuhrB.start],
+      note: "Unhurried — after the midday prayer"
+    });else mealSlots.push({
+      title: "Lunch",
+      dur: 35,
+      win: [wake + 300, wake + 420],
+      note: ""
+    });
+    if (maghribB) mealSlots.push({
+      title: "Dinner",
+      dur: 40,
+      win: [maghribB.end, Math.min(maghribB.end + 110, dinnerCap)],
+      alt: [asrB ? asrB.end : maghribB.start - 150, maghribB.start],
+      note: "Light + early enough to protect sleep"
+    });else mealSlots.push({
+      title: "Dinner",
+      dur: 40,
+      win: [sleep - 300, dinnerCap],
+      note: ""
+    });
+    for (const m of mealSlots) {
+      let s = fit(m.dur, m.win[0], m.win[1]);
+      let note = m.note;
+      if (s == null && m.alt) {
+        s = fit(m.dur, m.alt[0], m.alt[1]);
+        if (s != null) note = "Moved earlier to fit the day";
+      }
+      if (s != null) {
+        place({
+          title: m.title,
+          cat: "meal",
+          start: s,
+          end: s + m.dur,
+          note
+        });
+        meals.push([s, s + m.dur]);
+      }
+    }
+  }
+
+  /* 3.5 — Qur'an & dhikr */
+  if (includeQuran !== false) {
+    let qs = fit(15, fajrEnd + 5, fajrEnd + 120);
+    if (qs == null && maghribB) qs = fit(15, maghribB.end + 5, maghribB.end + 90);
+    if (qs != null) place({
+      title: "Qur'an & dhikr",
+      cat: "rest",
+      start: qs,
+      end: qs + 15,
+      note: "Daily connection — even one page counts"
+    });
+  }
+
+  /* 4 — workout, spaced from meals and ending clear of prayer */
+  if (workout.type && workout.type !== "none") {
+    const dur = workout.duration || 60;
+    const noMealBefore = s => !meals.some(([ms, me]) => s - me < 60 && s - me > -dur);
+    let win;
+    if (workout.pref === "morning") win = [wake + 45, dhuhrB ? dhuhrB.start - 15 : wake + 300];else if (workout.pref === "evening") win = [maghribB ? maghribB.end : sleep - 240, sleep - 120];else win = [asrB ? asrB.end : wake + 480, maghribB ? maghribB.start - 15 : sleep - 150];
+    let s = fit(dur, win[0], win[1], noMealBefore);
+    if (s == null) s = fit(dur, wake + 45, sleep - 120, noMealBefore);
+    if (s != null) place({
+      title: workout.type[0].toUpperCase() + workout.type.slice(1),
+      cat: "fitness",
+      start: s,
+      end: s + dur,
+      note: "Hydrate before + cooldown after (buffer added)"
+    });
+  }
+
+  /* 5 — deep work in the highest-energy windows */
+  const taskList = tasks.filter(Boolean);
+  const deepLen = energy === "high" ? 90 : energy === "low" ? 45 : 60;
+  const deepCount = Math.min(taskList.length, energy === "low" ? 2 : 3);
+  const morningStart = energy === "low" ? wake + 100 : fajrEnd + 15;
+  const windows = [[morningStart, dhuhrB ? dhuhrB.start - 10 : wake + 300], [dhuhrB ? dhuhrB.end + 40 : wake + 320, asrB ? asrB.start - 10 : wake + 540], [asrB ? asrB.end : wake + 560, maghribB ? maghribB.start - 10 : sleep - 180]];
+  if (energy === "low") windows.push(windows.shift()); // low energy: start after food/light, not first thing
+  let di = 0;
+  const notEatingSleep = (s, e) => e <= sleep - 75;
+  for (let i = 0; i < deepCount; i++) {
+    let placed = false;
+    for (const [ws, we] of windows) {
+      const s = fit(deepLen, ws, we, notEatingSleep);
+      if (s != null) {
+        place({
+          title: `Deep work — ${taskList[di]}`,
+          cat: "deep",
+          start: s,
+          end: s + deepLen,
+          note: i === 0 ? "Highest-energy window — protect it" : "Water + 2 min stretch after"
+        });
+        di++;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) break;
+  }
+
+  /* 6 — wind-down + sleep protection */
+  const wdStart = fit(45, sleep - 90, sleep, null, true);
+  if (wdStart != null) place({
+    title: "Wind-down",
+    cat: "rest",
+    start: wdStart,
+    end: wdStart + 45,
+    note: "Screens off, dim lights, tomorrow's plan out"
+  });
+  place({
+    title: "Sleep",
+    cat: "sleep",
+    start: sleep,
+    end: sleep + 30,
+    note: ""
+  }, 0);
+
+  /* 7 — remaining tasks as lighter blocks, then one daylight break */
+  for (; di < taskList.length; di++) {
+    const s = fit(30, wake + 60, sleep - 90, notEatingSleep);
+    if (s == null) break;
+    place({
+      title: taskList[di],
+      cat: "task",
+      start: s,
+      end: s + 30,
+      note: ""
+    });
+  }
+  const brk = fit(15, P.dhuhr ?? wake + 360, (P.maghrib ?? sleep) - 30);
+  if (brk != null) place({
+    title: "Outside break",
+    cat: "rest",
+    start: brk,
+    end: brk + 15,
+    note: "Natural light + short walk + water"
+  });
+  blocks.sort((a, b) => a.start - b.start || a.end - b.end);
+  return {
+    blocks,
+    dayEnd: sleep + 30
+  };
+}
+
+/* ============================================================
+   AI PLANNING (Groq — free API). Falls back to the rule engine.
+   ============================================================ */
+const AI_CAT = {
+  prayer: "prayer",
+  fixed: "fixed",
+  commitment: "fixed",
+  commute: "fixed",
+  "deep work": "deep",
+  deep: "deep",
+  study: "deep",
+  fitness: "fitness",
+  workout: "fitness",
+  meal: "meal",
+  rest: "rest",
+  "wind-down": "rest",
+  break: "rest",
+  task: "task",
+  sleep: "sleep"
+};
+function aiTimeToMin(s, wake) {
+  if (typeof s !== "string") return null;
+  const m = s.match(/(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  let t = Number(m[1]) * 60 + Number(m[2]);
+  if (t < wake - 180) t += 1440;
+  return t;
+}
+async function aiSchedule(cfg, key, profile) {
+  const {
+    wake,
+    prayers,
+    fixed,
+    tasks,
+    energy,
+    slept,
+    workout,
+    mealsCount,
+    hardline,
+    dateKey,
+    fasting,
+    includeQuran,
+    jumuah,
+    weekday
+  } = cfg;
+  const sleep = cfg.sleep <= wake ? cfg.sleep + 1440 : cfg.sleep;
+  const pf = t => t == null ? null : `${String(Math.floor((t % 1440 + 1440) % 1440 / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+  const payload = {
+    date: dateKey,
+    wake: pf(wake),
+    asleep_by: pf(sleep),
+    prayer_times: {
+      fajr: pf(prayers.fajr),
+      sunrise: pf(prayers.sunrise),
+      dhuhr: pf(prayers.dhuhr),
+      asr: pf(prayers.asr),
+      maghrib: pf(prayers.maghrib),
+      isha: pf(prayers.isha)
+    },
+    fixed_commitments: fixed.map(f => ({
+      title: f.title,
+      start: pf(f.start),
+      end: pf(f.end)
+    })),
+    tasks_free_text: tasks,
+    energy,
+    hours_slept: slept,
+    workout,
+    meals_per_day: mealsCount,
+    non_negotiable_or_deadline: hardline || "none",
+    fasting: !!fasting,
+    friday_jumuah_time: jumuah && jumuah.on && weekday === 5 && jumuah.time != null ? pf(jumuah.time) : null,
+    include_quran_block: includeQuran !== false
+  };
+  const rules = `Plan this person's day hour-by-hour from wake to asleep_by, as their intelligent personal planner.
+HARD RULES:
+1. The five prayers are immovable anchors. Each prayer block runs from 10 minutes BEFORE its adhan time (wudu) to 25 minutes after it. Never move, shrink, or skip a prayer, and nothing may overlap one.
+2. Include every fixed_commitment at its exact time. If one overlaps a prayer, split it around the prayer with the note "step out to pray, then resume".
+3. THINK about each task in tasks_free_text: decide what it really is and estimate a realistic duration yourself (quick email ~15m, homework/assignment 60-120m, big vague projects get a focused 90m "start" block). Split anything over 120m into parts across the day. Infer urgency and deadlines from the wording ("due tonight" must finish before that deadline) and schedule urgent items earlier and in better slots.
+4. Deep/study work goes in the highest-energy windows given energy and hours_slept (high energy: morning after breakfast; low energy: late morning, only after food and light). Protect these blocks from fragmentation.
+5. If a workout is given, it is a real block: at least 60m after any meal, ending 15m clear of any prayer; add a hydration/cooldown note.
+6. Meals are unhurried (25-40m), placed near prayers where natural; dinner at least 2.5h before sleep; favor whole foods in notes.
+7. Schedule a 45m screen-free wind-down before sleep. The final block is "Sleep".
+8. Keep 5-10m transitions between everything. If a fixed commitment is clearly on-site (class, shift, internship, appointment), add a commute block before and after it using the profile's commute time.
+9. Add one short outdoor light/movement/hydration break in the afternoon.
+10. Every block gets one short practical note. Cover the whole day: no unexplained gap over 45m (label genuine free time as a rest or "Open / catch-up" task block).
+11. If fasting is true: NO midday meals at all; schedule Suhoor ending 15m before Fajr when the person is awake for it, and Iftar immediately after Maghrib prayer (note: break with dates + water at adhan, pray, then eat); keep any workout light, ideally in the last hour before Iftar.
+12. If friday_jumuah_time is set: replace Dhuhr with a "Jumu'ah" block from 30m before that time to 60m after it, with a travel/arrive-early note.
+13. If include_quran_block is true: add a 10-15m "Qur'an & dhikr" block after Fajr (or after Maghrib if the morning is packed).
+PROFILE OF THE PERSON: ${profile}
+Respond with ONLY valid JSON, no prose: {"blocks":[{"title":string,"category":"prayer|fixed|deep|fitness|meal|rest|task|sleep","start":"HH:MM","end":"HH:MM","note":string}]} using 24-hour times.`;
+  const call = async model => {
+    const body = {
+      model,
+      temperature: 0.3,
+      max_tokens: 6000,
+      response_format: {
+        type: "json_object"
+      },
+      messages: [{
+        role: "system",
+        content: "You are a meticulous daily-schedule planning engine for a practicing Muslim. You output only strict JSON."
+      }, {
+        role: "user",
+        content: rules + "\n\nINPUT:\n" + JSON.stringify(payload)
+      }]
+    };
+    if (model.includes("gpt-oss")) body.reasoning_effort = "medium";
+    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`
+      },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error("Groq error " + r.status);
+    const d = await r.json();
+    return d.choices[0].message.content;
+  };
+  // strongest available first; cascade past model errors, rate limits, or malformed JSON
+  const MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+  let raw = null,
+    lastErr = null;
+  for (const model of MODELS) {
+    try {
+      const text = await call(model);
+      const parsed = JSON.parse(String(text).replace(/```json|```/g, "").trim());
+      if (Array.isArray(parsed.blocks) && parsed.blocks.length > 0) {
+        raw = parsed.blocks;
+        break;
+      }
+      throw new Error("no blocks in reply");
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!raw) throw lastErr || new Error("AI planning failed on all models");
+  let blocks = raw.map(b => {
+    const start = aiTimeToMin(b.start, wake);
+    let end = aiTimeToMin(b.end, wake);
+    if (start == null || end == null) return null;
+    if (end <= start) end += 1440;
+    if (end - start > 12 * 60) return null;
+    const cat = AI_CAT[String(b.category || "task").toLowerCase().trim()] || "task";
+    return {
+      id: uid(),
+      title: String(b.title || "Block").slice(0, 80),
+      cat,
+      start,
+      end,
+      note: String(b.note || "").slice(0, 140)
+    };
+  }).filter(Boolean).filter(b => b.end > wake - 30 && b.start < sleep + 150);
+  if (blocks.length < 5) throw new Error("AI returned too few blocks");
+  // safety net: every prayer in the waking day must be present — inject if the model dropped one
+  for (const [n, t] of [["Fajr", prayers.fajr], ["Dhuhr", prayers.dhuhr], ["Asr", prayers.asr], ["Maghrib", prayers.maghrib], ["Isha", prayers.isha]]) {
+    if (t == null) continue;
+    let tt = t < wake ? t + 1440 : t;
+    if (tt >= wake && tt <= sleep + 30 && !blocks.some(b => b.cat === "prayer" && b.title.toLowerCase().includes(n.toLowerCase()))) blocks.push({
+      id: uid(),
+      title: n,
+      cat: "prayer",
+      start: tt - 10,
+      end: tt + 25,
+      note: "Anchor — restored"
+    });
+  }
+  blocks.sort((a, b) => a.start - b.start || a.end - b.end);
+  const dayEnd = Math.max(sleep + 30, blocks[blocks.length - 1].end);
+  return {
+    blocks,
+    dayEnd
+  };
+}
+
+/* ============================================================ */
+function App() {
+  const [step, setStep] = useState("loading"); // loading | setup | input | questions | schedule | settings
+  const [settings, setSettings] = useState(null); // {city:{name,lat,lng}, method, asrFactor, wake, sleep}
+  const [recurring, setRecurring] = useState([]);
+  const [savedPlan, setSavedPlan] = useState(null);
+  const [session, setSession] = useState(null);
+  const [history, setHistory] = useState({});
+  const [returnTo, setReturnTo] = useState("input");
+
+  // per-plan state
+  const tomorrow = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return d;
+  }, []);
+  const [planDate, setPlanDate] = useState(tomorrow);
+  const [includedRec, setIncludedRec] = useState({});
+  const [oneOffs, setOneOffs] = useState([]);
+  const [taskText, setTaskText] = useState("");
+  const [q, setQ] = useState({
+    wake: "06:00",
+    sleep: "23:00",
+    slept: "7",
+    energy: "medium",
+    workoutType: "none",
+    workoutDur: 60,
+    workoutPref: "afternoon",
+    meals: 3,
+    fasting: "no",
+    hardline: ""
+  });
+  const [plan, setPlan] = useState(null); // {dateKey, blocks, dayStart, dayEnd, prayers, hardline}
+  const [editing, setEditing] = useState(null);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const loadData = async () => {
+    setStep("loading");
+    const s = await sGet("btp:settings");
+    const r = await sGet("btp:recurring");
+    const p = await sGet("btp:plan");
+    const h = (await sGet("btp:history")) || {};
+    setHistory(h);
+    if (r) setRecurring(r);
+    const best = h[localKey(new Date())] || p;
+    if (best) setSavedPlan(best);
+    if (s && s.city) {
+      setSettings(s);
+      setQ(old => ({
+        ...old,
+        wake: s.wake || old.wake,
+        sleep: s.sleep || old.sleep
+      }));
+      setStep("input");
+    } else setStep("setup");
+  };
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!getConfig()) {
+          setStep("connect");
+          return;
+        }
+        const client = getClient();
+        const {
+          data: {
+            session: sess
+          }
+        } = await client.auth.getSession();
+        setSession(sess);
+        client.auth.onAuthStateChange((_e, s2) => setSession(s2));
+        if (!sess) {
+          setStep("auth");
+          return;
+        }
+        await loadData();
+      } catch (e) {
+        console.error("boot problem — loading this device's saved copy", e);
+        await loadData();
+      }
+    })();
+  }, []);
+  const signOut = async () => {
+    try {
+      await getClient().auth.signOut();
+    } catch {}
+    window.location.reload();
+  };
+  const exportData = async () => {
+    const dump = {
+      settings: await sGet("btp:settings"),
+      recurring: await sGet("btp:recurring"),
+      plan: await sGet("btp:plan"),
+      exportedAt: new Date().toISOString()
+    };
+    const blob = new Blob([JSON.stringify(dump, null, 2)], {
+      type: "application/json"
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "block-time-backup.json";
+    a.click();
+  };
+  const dateKey = localKey(planDate);
+  const weekday = planDate.getDay();
+  const todaysRec = recurring.filter(c => c.days.includes(weekday));
+  useEffect(() => {
+    const map = {};
+    todaysRec.forEach(c => map[c.id] = includedRec[c.id] !== false);
+    setIncludedRec(map);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateKey, recurring.length]);
+  const prayers = useMemo(() => {
+    if (!settings?.city) return null;
+    return computePrayerTimes(planDate, settings.city.lat, settings.city.lng, settings.method || "ISNA", settings.asrFactor || 1);
+  }, [settings, dateKey]);
+  const streak = useMemo(() => {
+    let s = 0;
+    const d = new Date();
+    if (!history[localKey(d)]) d.setDate(d.getDate() - 1);
+    while (history[localKey(d)]) {
+      s++;
+      d.setDate(d.getDate() - 1);
+    }
+    return s;
+  }, [history]);
+  const carryover = useMemo(() => {
+    const keys = Object.keys(history).filter(k => k < dateKey).sort();
+    const prev = keys.length ? history[keys[keys.length - 1]] : null;
+    if (!prev || !Array.isArray(prev.blocks)) return [];
+    return prev.blocks.filter(b => (b.cat === "task" || b.cat === "deep") && !b.done).map(b => b.title.replace(/^Deep work — /, "")).slice(0, 6);
+  }, [history, dateKey]);
+  const generate = async () => {
+    const wake = fromInputVal(q.wake),
+      sleep = fromInputVal(q.sleep);
+    const fixed = [...todaysRec.filter(c => includedRec[c.id]).map(c => ({
+      title: c.title,
+      start: fromInputVal(c.start),
+      end: fromInputVal(c.end)
+    })), ...oneOffs.filter(o => o.title && o.start && o.end).map(o => ({
+      title: o.title,
+      start: fromInputVal(o.start),
+      end: fromInputVal(o.end)
+    }))].map(f => ({
+      ...f,
+      end: f.end <= f.start ? f.end + 1440 : f.end
+    }));
+    const tasks = taskText.split("\n").map(t => t.trim().replace(/^[-•]\s*/, "")).filter(Boolean);
+    const cfg = {
+      wake,
+      sleep,
+      prayers,
+      fixed,
+      tasks,
+      energy: q.energy,
+      slept: q.slept,
+      workout: {
+        type: q.workoutType,
+        duration: Number(q.workoutDur) || 60,
+        pref: q.workoutPref
+      },
+      mealsCount: Number(q.meals),
+      hardline: q.hardline.trim(),
+      dateKey,
+      fasting: q.fasting === "yes",
+      weekday: planDate.getDay(),
+      includeQuran: settings.includeQuran !== false,
+      jumuah: {
+        on: settings.attendJumuah !== false,
+        time: fromInputVal(settings.jumuahTime || "13:30")
+      }
+    };
+    if (settings.groqKey && settings.groqKey.trim()) {
+      setStep("generating");
+      try {
+        const {
+          blocks,
+          dayEnd
+        } = await aiSchedule(cfg, settings.groqKey.trim(), settings.aiProfile || "A busy Muslim college student.");
+        setPlan({
+          dateKey,
+          blocks,
+          dayStart: wake,
+          dayEnd,
+          prayers,
+          hardline: cfg.hardline,
+          ai: true
+        });
+        setStep("schedule");
+        return;
+      } catch (e) {
+        console.error("AI planning failed — falling back to rule-based plan", e);
+      }
+    }
+    const {
+      blocks,
+      dayEnd
+    } = buildSchedule(cfg);
+    setPlan({
+      dateKey,
+      blocks,
+      dayStart: wake,
+      dayEnd,
+      prayers,
+      hardline: cfg.hardline,
+      ai: false
+    });
+    setStep("schedule");
+  };
+  const persist = async p => {
+    await sSet("btp:plan", p);
+    const h = {
+      ...history,
+      [p.dateKey]: p
+    };
+    setHistory(h);
+    await sSet("btp:history", h);
+    setSavedPlan(p);
+  };
+  const savePlan = async () => {
+    await persist(plan);
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 1600);
+  };
+  const autoSave = async p => {
+    setPlan(p);
+    await persist(p);
+  };
+  const replanRest = async () => {
+    if (!plan || !settings?.groqKey) return;
+    const d = new Date();
+    let nm = d.getHours() * 60 + d.getMinutes();
+    if (nm < plan.dayStart - 180) nm += 1440;
+    nm = Math.ceil(nm / 5) * 5;
+    const past = b => b.end <= nm || b.done;
+    const keep = plan.blocks.filter(past);
+    const rest = plan.blocks.filter(b => !past(b));
+    const tasks = rest.filter(b => b.cat === "deep" || b.cat === "task").map(b => b.title.replace(/^Deep work — /, ""));
+    const fixedRest = rest.filter(b => b.cat === "fixed").map(b => ({
+      title: b.title,
+      start: Math.max(b.start, nm + 5),
+      end: b.end
+    }));
+    setStep("generating");
+    try {
+      const {
+        blocks
+      } = await aiSchedule({
+        wake: nm,
+        sleep: plan.dayEnd - 30,
+        prayers: plan.prayers,
+        fixed: fixedRest,
+        tasks,
+        energy: q.energy,
+        slept: q.slept,
+        workout: {
+          type: "none"
+        },
+        mealsCount: Number(q.meals),
+        hardline: plan.hardline,
+        dateKey: plan.dateKey,
+        fasting: q.fasting === "yes",
+        weekday: new Date(plan.dateKey + "T12:00").getDay(),
+        includeQuran: false,
+        jumuah: {
+          on: settings.attendJumuah !== false,
+          time: fromInputVal(settings.jumuahTime || "13:30")
+        }
+      }, settings.groqKey.trim(), (settings.aiProfile || "") + " IMPORTANT: this is a MID-DAY REPLAN. The given wake time is the current time; plan only the remainder of the day from there.");
+      const np = {
+        ...plan,
+        blocks: [...keep, ...blocks].sort((a, b) => a.start - b.start || a.end - b.end),
+        ai: true
+      };
+      await autoSave(np);
+    } catch (e) {
+      console.error("replan failed", e);
+    }
+    setStep("schedule");
+  };
+  const css = `
+    @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Karla:wght@400;500;600;700&family=Spline+Sans+Mono:wght@400;500&display=swap');
+    :root{ --bg:#12141C; --surface:#1B1F2B; --surface2:#232838; --line:#2C3245; --ink:#ECE9E1; --muted:#8A8FA3; --amber:#E3A857; }
+    *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+    .btp{min-height:100vh;background:var(--bg);color:var(--ink);font-family:'Karla',system-ui,sans-serif;font-size:15px;line-height:1.45}
+    .wrap{max-width:520px;margin:0 auto;padding:20px 16px 190px}
+    .brand{font-family:'Instrument Serif',serif;font-size:26px;letter-spacing:.2px}
+    .brand em{color:var(--amber);font-style:normal}
+    .eyebrow{font-family:'Spline Sans Mono',monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+    h2{font-family:'Instrument Serif',serif;font-weight:400;font-size:24px;margin:6px 0 2px}
+    .sub{color:var(--muted);font-size:13.5px;margin-bottom:18px}
+    .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+    label.fld{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px;font-weight:600}
+    input[type=text],input[type=time],input[type=number],input[type=date],textarea,select{
+      width:100%;background:var(--surface2);border:1px solid var(--line);border-radius:10px;color:var(--ink);
+      padding:10px 12px;font-family:'Karla',sans-serif;font-size:15px;outline:none}
+    input:focus,textarea:focus,select:focus{border-color:var(--amber)}
+    input[type=time],input[type=number]{font-family:'Spline Sans Mono',monospace;font-size:14px}
+    textarea{min-height:96px;resize:vertical}
+    .chiprow{display:flex;flex-wrap:wrap;gap:8px}
+    .chip{background:var(--surface2);border:1px solid var(--line);color:var(--ink);border-radius:999px;padding:7px 14px;font-size:13.5px;cursor:pointer;font-weight:600}
+    .chip.on{background:rgba(227,168,87,.16);border-color:var(--amber);color:var(--amber)}
+    .btn{display:block;width:100%;background:var(--amber);color:#1a1408;border:none;border-radius:12px;padding:14px;font-size:16px;font-weight:700;font-family:'Karla',sans-serif;cursor:pointer}
+    .btn:active{transform:scale(.99)}
+    .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line);font-weight:600}
+    .btn:focus-visible,.chip:focus-visible,.blk:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+    .row{display:flex;gap:8px;align-items:center}
+    .grow{flex:1}
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+    .icnbtn{background:var(--surface);border:1px solid var(--line);color:var(--muted);border-radius:10px;padding:7px 11px;font-size:13px;cursor:pointer;font-weight:600}
+    .ptimes{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 4px}
+    .ptag{font-family:'Spline Sans Mono',monospace;font-size:11.5px;background:rgba(227,168,87,.1);border:1px solid rgba(227,168,87,.3);color:var(--amber);border-radius:8px;padding:4px 8px}
+    /* timeline */
+    .tl{position:relative;padding-left:18px}
+    .rail{position:absolute;left:0;top:0;bottom:0;width:6px;border-radius:3px}
+    .hourline{position:absolute;left:0;right:0;border-top:1px solid rgba(44,50,69,.55)}
+    .hourlbl{position:absolute;left:-72px;width:56px;text-align:right;font-family:'Spline Sans Mono',monospace;font-size:10.5px;color:var(--muted);transform:translateY(-6px)}
+    .blk{position:relative;display:block;width:100%;background:var(--surface);border:1px solid var(--line);border-left:4px solid;border-radius:10px;padding:9px 36px 9px 12px;margin-bottom:8px;cursor:pointer;text-align:left;font-family:'Karla',sans-serif;color:var(--ink)}
+    .blk.isdone{opacity:.55}
+    .blk.isdone .t{text-decoration:line-through}
+    .donec{position:absolute;right:9px;top:9px;width:20px;height:20px;border-radius:999px;border:1.5px solid;font-size:13px;line-height:18px;text-align:center;cursor:pointer;flex:none}
+    .pdiamond{position:absolute;left:-23px;top:14px;width:10px;height:10px;background:var(--amber);transform:rotate(45deg);border-radius:2px;box-shadow:0 0 8px rgba(227,168,87,.5)}
+    .gapdiv{color:var(--muted);font-family:'Spline Sans Mono',monospace;font-size:11px;text-align:center;padding:5px 0 13px;opacity:.75}
+    .nowline{border-top:2px solid #E06E6E;margin:2px 0 10px;position:relative}
+    .nowline span{position:absolute;right:0;top:-9px;background:#E06E6E;color:#12141C;font-size:10px;font-family:'Spline Sans Mono',monospace;border-radius:6px;padding:1px 7px;font-weight:700}
+    .blk .t{font-weight:700;font-size:13.5px;line-height:1.25}
+    .blk .tm{font-family:'Spline Sans Mono',monospace;font-size:10.5px;color:var(--muted)}
+    .blk .nt{font-size:11.5px;color:var(--muted);line-height:1.3;margin-top:1px}
+    .anchor{position:absolute;left:-24px;width:10px;height:10px;background:var(--amber);transform:rotate(45deg) translateY(-4px);border-radius:2px;box-shadow:0 0 8px rgba(227,168,87,.5)}
+    .sheet{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);border-radius:18px 18px 0 0;padding:18px 16px 26px;max-width:520px;margin:0 auto;z-index:50;box-shadow:0 -12px 40px rgba(0,0,0,.5)}
+    .scrim{position:fixed;inset:0;background:rgba(6,8,14,.6);z-index:40}
+    .pin{background:rgba(227,168,87,.1);border:1px solid rgba(227,168,87,.35);border-radius:12px;padding:10px 12px;font-size:13.5px;margin-bottom:12px}
+    .pin b{color:var(--amber)}
+    .fab{position:fixed;bottom:18px;right:16px;z-index:30;background:var(--amber);color:#1a1408;border:none;border-radius:999px;width:52px;height:52px;font-size:26px;font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+    .barbtns{position:fixed;bottom:0;left:0;right:0;background:linear-gradient(transparent, var(--bg) 40%);padding:24px 16px 16px;max-width:520px;margin:0 auto}
+    .del{background:rgba(224,110,110,.12);border:1px solid rgba(224,110,110,.4);color:#e08a7a}
+    .flash{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:var(--surface2);border:1px solid var(--amber);color:var(--amber);padding:8px 16px;border-radius:999px;font-size:13px;z-index:60}
+    .reclist .row{padding:8px 0;border-bottom:1px solid var(--line)}
+    .reclist .row:last-child{border-bottom:none}
+    .mini{font-family:'Spline Sans Mono',monospace;font-size:12px;color:var(--muted)}
+    a{color:var(--amber)}
+    @media (prefers-reduced-motion: reduce){ *{transition:none!important;animation:none!important} }
+  `;
+
+  /* ---------- shared header ---------- */
+  const Header = ({
+    back,
+    onBack
+  }) => /*#__PURE__*/React.createElement("div", {
+    className: "topbar"
+  }, back ? /*#__PURE__*/React.createElement("button", {
+    className: "icnbtn",
+    onClick: onBack
+  }, "← Back") : /*#__PURE__*/React.createElement("div", {
+    className: "brand"
+  }, "block", /*#__PURE__*/React.createElement("em", null, "·"), "time"), step !== "settings" && /*#__PURE__*/React.createElement("button", {
+    className: "icnbtn",
+    onClick: () => {
+      setReturnTo(step);
+      setStep("settings");
+    }
+  }, "Settings"));
+  if (step === "loading") return /*#__PURE__*/React.createElement("div", {
+    className: "btp"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+    className: "wrap",
+    style: {
+      paddingTop: 80,
+      textAlign: "center",
+      color: "#8A8FA3"
+    }
+  }, "Opening your planner…"));
+  if (step === "generating") return /*#__PURE__*/React.createElement("div", {
+    className: "btp"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+    className: "wrap",
+    style: {
+      paddingTop: 80,
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "brand",
+    style: {
+      marginBottom: 18
+    }
+  }, "block", /*#__PURE__*/React.createElement("em", null, "·"), "time"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: "#E3A857",
+      fontSize: 16,
+      fontWeight: 700,
+      marginBottom: 8
+    }
+  }, "Thinking through your day…"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: "#8A8FA3",
+      fontSize: 13
+    }
+  }, "Estimating how long each task needs, finding your best focus windows, and anchoring everything around the five prayers.")));
+  if (step === "connect") return /*#__PURE__*/React.createElement(ConnectView, {
+    css: css,
+    onDone: cfg => {
+      localStorage.setItem("btp:config", JSON.stringify(cfg));
+      window.location.reload();
+    }
+  });
+  if (step === "auth") return /*#__PURE__*/React.createElement(AuthView, {
+    css: css,
+    onSignedIn: loadData
+  });
+
+  /* ============ SETUP (first run) ============ */
+  if (step === "setup" || step === "settings") {
+    return /*#__PURE__*/React.createElement(SettingsView, {
+      css: css,
+      firstRun: step === "setup",
+      accountEmail: session?.user?.email,
+      onSignOut: signOut,
+      onExport: exportData,
+      settings: settings,
+      recurring: recurring,
+      onDone: async (s, r) => {
+        setSettings(s);
+        setRecurring(r);
+        await sSet("btp:settings", s);
+        await sSet("btp:recurring", r);
+        setStep(step === "setup" ? "input" : returnTo);
+      }
+    });
+  }
+
+  /* ============ STEP 1 — INPUT ============ */
+  if (step === "input") {
+    const dateChip = (d, lbl) => /*#__PURE__*/React.createElement("button", {
+      key: lbl,
+      className: `chip ${planDate.toDateString() === d.toDateString() ? "on" : ""}`,
+      onClick: () => setPlanDate(d)
+    }, lbl);
+    const today = new Date();
+    return /*#__PURE__*/React.createElement("div", {
+      className: "btp"
+    }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+      className: "wrap"
+    }, /*#__PURE__*/React.createElement(Header, null), /*#__PURE__*/React.createElement("div", {
+      className: "eyebrow"
+    }, "Step 1 of 3"), /*#__PURE__*/React.createElement("h2", null, "What does ", planDate.toDateString() === today.toDateString() ? "today" : "tomorrow", " hold?"), /*#__PURE__*/React.createElement("div", {
+      className: "sub"
+    }, planDate.toLocaleDateString(undefined, {
+      weekday: "long",
+      month: "long",
+      day: "numeric"
+    }), " · ", settings.city.name), savedPlan && /*#__PURE__*/React.createElement("div", {
+      className: "pin",
+      style: {
+        cursor: "pointer"
+      },
+      onClick: () => {
+        setPlan(savedPlan);
+        setStep("schedule");
+      }
+    }, /*#__PURE__*/React.createElement("b", null, "Saved plan"), " from ", savedPlan.dateKey, " — tap to open"), streak > 1 && /*#__PURE__*/React.createElement("div", {
+      className: "mini",
+      style: {
+        marginBottom: 12,
+        color: "#E3A857"
+      }
+    }, "🔥 ", streak, "-day planning streak — keep it alive"), carryover.length > 0 && /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Unfinished from your last plan — tap to add to today"), /*#__PURE__*/React.createElement("div", {
+      className: "chiprow"
+    }, carryover.map(t => /*#__PURE__*/React.createElement("button", {
+      key: t,
+      className: "chip",
+      onClick: () => setTaskText(prev => prev.includes(t) ? prev : (prev ? prev + "\n" : "") + t)
+    }, "+ ", t)))), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Planning for"), /*#__PURE__*/React.createElement("div", {
+      className: "chiprow"
+    }, dateChip(today, "Today"), dateChip(tomorrow, "Tomorrow"))), todaysRec.length > 0 && /*#__PURE__*/React.createElement("div", {
+      className: "card reclist"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Your usual ", DAYS[weekday], " commitments — uncheck anything that's off"), todaysRec.map(c => /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      key: c.id
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "checkbox",
+      checked: includedRec[c.id] !== false,
+      onChange: e => setIncludedRec({
+        ...includedRec,
+        [c.id]: e.target.checked
+      }),
+      style: {
+        width: 18,
+        height: 18
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, c.title), /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, fmt(fromInputVal(c.start)), "–", fmt(fromInputVal(c.end)))))), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "One-off fixed commitments (meetings, appointments, shifts)"), oneOffs.map((o, i) => /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      key: i,
+      style: {
+        marginBottom: 8
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "text",
+      placeholder: "What",
+      value: o.title,
+      className: "grow",
+      onChange: e => setOneOffs(oneOffs.map((x, j) => j === i ? {
+        ...x,
+        title: e.target.value
+      } : x))
+    }), /*#__PURE__*/React.createElement("input", {
+      type: "time",
+      value: o.start,
+      style: {
+        width: 96
+      },
+      onChange: e => setOneOffs(oneOffs.map((x, j) => j === i ? {
+        ...x,
+        start: e.target.value
+      } : x))
+    }), /*#__PURE__*/React.createElement("input", {
+      type: "time",
+      value: o.end,
+      style: {
+        width: 96
+      },
+      onChange: e => setOneOffs(oneOffs.map((x, j) => j === i ? {
+        ...x,
+        end: e.target.value
+      } : x))
+    }))), /*#__PURE__*/React.createElement("button", {
+      className: "chip",
+      onClick: () => setOneOffs([...oneOffs, {
+        title: "",
+        start: "",
+        end: ""
+      }])
+    }, "+ Add commitment")), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Everything else you want done — one per line"), /*#__PURE__*/React.createElement("textarea", {
+      placeholder: "Finish ML homework\nEmail Carlos about M-301\nReview scRNA-seq notes",
+      value: taskText,
+      onChange: e => setTaskText(e.target.value)
+    })), /*#__PURE__*/React.createElement("button", {
+      className: "btn",
+      onClick: () => setStep("questions")
+    }, "Next — a few quick questions")));
+  }
+
+  /* ============ STEP 2 — QUESTIONS ============ */
+  if (step === "questions") {
+    const set = (k, v) => setQ({
+      ...q,
+      [k]: v
+    });
+    const chip = (k, v, lbl) => /*#__PURE__*/React.createElement("button", {
+      key: v,
+      className: `chip ${q[k] === v ? "on" : ""}`,
+      onClick: () => set(k, v)
+    }, lbl || v);
+    return /*#__PURE__*/React.createElement("div", {
+      className: "btp"
+    }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+      className: "wrap"
+    }, /*#__PURE__*/React.createElement(Header, {
+      back: true,
+      onBack: () => setStep("input")
+    }), /*#__PURE__*/React.createElement("div", {
+      className: "eyebrow"
+    }, "Step 2 of 3"), /*#__PURE__*/React.createElement("h2", null, "Six quick questions"), /*#__PURE__*/React.createElement("div", {
+      className: "sub"
+    }, "Prayer times for ", settings.city.name, " are already calculated — the day gets built around them."), prayers && /*#__PURE__*/React.createElement("div", {
+      className: "ptimes"
+    }, [["Fajr", prayers.fajr], ["Dhuhr", prayers.dhuhr], ["Asr", prayers.asr], ["Maghrib", prayers.maghrib], ["Isha", prayers.isha]].map(([n, t]) => /*#__PURE__*/React.createElement("span", {
+      className: "ptag",
+      key: n
+    }, n, " ", fmt(t)))), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "1 · Waking up and lights out"), /*#__PURE__*/React.createElement("div", {
+      className: "row"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Wake"), /*#__PURE__*/React.createElement("input", {
+      type: "time",
+      value: q.wake,
+      onChange: e => set("wake", e.target.value)
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Asleep by"), /*#__PURE__*/React.createElement("input", {
+      type: "time",
+      value: q.sleep,
+      onChange: e => set("sleep", e.target.value)
+    }))), prayers && fromInputVal(q.wake) > prayers.fajr && /*#__PURE__*/React.createElement("div", {
+      className: "mini",
+      style: {
+        marginTop: 8,
+        color: "#E3A857"
+      }
+    }, "Fajr is ", fmt(prayers.fajr), " — waking after adhan is fine, Fajr goes first on waking.")), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "2 · How's your energy for this day?"), /*#__PURE__*/React.createElement("div", {
+      className: "chiprow"
+    }, chip("energy", "high", "High"), chip("energy", "medium", "Medium"), chip("energy", "low", "Low")), /*#__PURE__*/React.createElement("label", {
+      className: "fld",
+      style: {
+        marginTop: 10
+      }
+    }, "Hours of sleep you'll have had"), /*#__PURE__*/React.createElement("input", {
+      type: "number",
+      min: "3",
+      max: "12",
+      step: "0.5",
+      value: q.slept,
+      onChange: e => set("slept", e.target.value),
+      style: {
+        width: 110
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "3 · Any workout planned?"), /*#__PURE__*/React.createElement("div", {
+      className: "chiprow"
+    }, ["none", "tennis", "pickleball", "gym", "run"].map(w => chip("workoutType", w, w[0].toUpperCase() + w.slice(1)))), q.workoutType !== "none" && /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      style: {
+        marginTop: 10
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Minutes"), /*#__PURE__*/React.createElement("input", {
+      type: "number",
+      min: "20",
+      max: "180",
+      step: "5",
+      value: q.workoutDur,
+      onChange: e => set("workoutDur", e.target.value)
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "grow"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "Prefer"), /*#__PURE__*/React.createElement("select", {
+      value: q.workoutPref,
+      onChange: e => set("workoutPref", e.target.value)
+    }, /*#__PURE__*/React.createElement("option", {
+      value: "morning"
+    }, "Morning"), /*#__PURE__*/React.createElement("option", {
+      value: "afternoon"
+    }, "Afternoon"), /*#__PURE__*/React.createElement("option", {
+      value: "evening"
+    }, "Evening"))))), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "4 · Meals & fasting"), /*#__PURE__*/React.createElement("div", {
+      className: "chiprow"
+    }, /*#__PURE__*/React.createElement("button", {
+      className: `chip ${q.fasting !== "yes" ? "on" : ""}`,
+      onClick: () => set("fasting", "no")
+    }, "Not fasting"), /*#__PURE__*/React.createElement("button", {
+      className: `chip ${q.fasting === "yes" ? "on" : ""}`,
+      onClick: () => set("fasting", "yes")
+    }, "Fasting")), q.fasting === "yes" ? /*#__PURE__*/React.createElement("div", {
+      className: "mini",
+      style: {
+        marginTop: 8
+      }
+    }, "Suhoor before Fajr (if you're up for it), iftar at Maghrib — no midday meals will be scheduled.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      className: "chiprow",
+      style: {
+        marginTop: 10
+      }
+    }, [2, 3].map(n => /*#__PURE__*/React.createElement("button", {
+      key: n,
+      className: `chip ${Number(q.meals) === n ? "on" : ""}`,
+      onClick: () => set("meals", n)
+    }, n, " meals"))), /*#__PURE__*/React.createElement("div", {
+      className: "mini",
+      style: {
+        marginTop: 8
+      }
+    }, "Spacing from workouts and sleep is handled automatically."))), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "5 · Anything non-negotiable or hard-deadline?"), /*#__PURE__*/React.createElement("input", {
+      type: "text",
+      placeholder: "e.g. B429 assignment due 11:59 PM",
+      value: q.hardline,
+      onChange: e => set("hardline", e.target.value)
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "card"
+    }, /*#__PURE__*/React.createElement("label", {
+      className: "fld"
+    }, "6 · Confirm the anchors look right"), /*#__PURE__*/React.createElement("div", {
+      className: "mini"
+    }, "Prayers get a 10-min wudu buffer and are never squeezed. Deep work lands in your ", q.energy === "low" ? "late-morning (after food + light)" : "morning", " window given ", q.energy, " energy.")), /*#__PURE__*/React.createElement("button", {
+      className: "btn",
+      onClick: generate
+    }, settings.groqKey ? "Build my day with AI" : "Build my day")));
+  }
+
+  /* ============ STEP 3 — SCHEDULE ============ */
+  if (step === "schedule" && plan) {
+    return /*#__PURE__*/React.createElement(ScheduleView, {
+      css: css,
+      plan: plan,
+      setPlan: setPlan,
+      editing: editing,
+      setEditing: setEditing,
+      onSave: savePlan,
+      savedFlash: savedFlash,
+      onReplan: () => setStep("input"),
+      onAutoSave: autoSave,
+      onReplanRest: replanRest,
+      canReplan: !!(settings && settings.groqKey),
+      Header: Header
+    });
+  }
+  return null;
+}
+
+/* ============================================================
+   SCHEDULE / TIMELINE VIEW
+   ============================================================ */
+function ScheduleView({
+  css,
+  plan,
+  setPlan,
+  editing,
+  setEditing,
+  onSave,
+  savedFlash,
+  onReplan,
+  onAutoSave,
+  onReplanRest,
+  canReplan,
+  Header
+}) {
+  const [copied, setCopied] = useState(false);
+  const [nowRaw, setNowRaw] = useState(() => new Date());
+  useEffect(() => {
+    const i = setInterval(() => setNowRaw(new Date()), 30000);
+    return () => clearInterval(i);
+  }, []);
+  const PPM = 1.15; // px per minute
+  const {
+    blocks,
+    dayStart,
+    dayEnd,
+    prayers,
+    hardline
+  } = plan;
+  const H = (dayEnd - dayStart) * PPM;
+  const isToday = plan.dateKey === localKey(new Date());
+  let nm = nowRaw.getHours() * 60 + nowRaw.getMinutes();
+  if (nm < dayStart - 180) nm += 1440;
+  const nextPrayer = isToday ? blocks.find(b => b.cat === "prayer" && b.start + 10 > nm) : null;
+  const npMins = nextPrayer ? Math.max(0, nextPrayer.start + 10 - nm) : 0;
+  const doneCount = blocks.filter(b => b.done).length;
+  const deepMins = blocks.filter(b => b.cat === "deep").reduce((s, b) => s + (b.end - b.start), 0);
+  const fitMins = blocks.filter(b => b.cat === "fitness").reduce((s, b) => s + (b.end - b.start), 0);
+  const toggleDone = id => {
+    onAutoSave({
+      ...plan,
+      blocks: blocks.map(b => b.id === id ? {
+        ...b,
+        done: !b.done
+      } : b)
+    });
+  };
+  const downloadIcs = () => {
+    const blob = new Blob([icsForPlan(plan)], {
+      type: "text/calendar"
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `blocktime-${plan.dateKey}.ics`;
+    a.click();
+  };
+  const pct = t => Math.max(0, Math.min(100, (t - dayStart) / (dayEnd - dayStart) * 100));
+  const railBg = prayers ? `linear-gradient(180deg,#151a2e 0%,#151a2e ${pct(prayers.fajr)}%,#E3A857 ${pct(prayers.sunrise)}%,#8fa3c4 ${pct(prayers.sunrise) + 6}%,#8fa3c4 ${pct(prayers.maghrib) - 6}%,#E3A857 ${pct(prayers.maghrib)}%,#151a2e ${pct(prayers.isha)}%,#0e1120 100%)` : "#2C3245";
+  const hours = [];
+  for (let t = Math.ceil(dayStart / 60) * 60; t <= dayEnd; t += 60) hours.push(t);
+
+  // lane offsets for overlapping blocks
+  const laid = blocks.map(b => ({
+    ...b
+  }));
+  laid.forEach((b, i) => {
+    b.lane = 0;
+    for (let j = 0; j < i; j++) if (laid[j].start < b.end && laid[j].end > b.start && laid[j].lane === b.lane) {
+      b.lane++;
+      j = -1;
+    }
+  });
+  const update = (id, patch) => setPlan({
+    ...plan,
+    blocks: blocks.map(b => b.id === id ? {
+      ...b,
+      ...patch
+    } : b).sort((a, b) => a.start - b.start)
+  });
+  const remove = id => {
+    setPlan({
+      ...plan,
+      blocks: blocks.filter(b => b.id !== id)
+    });
+    setEditing(null);
+  };
+  const addBlock = () => {
+    const nb = {
+      id: uid(),
+      title: "New block",
+      cat: "task",
+      start: dayStart + 60,
+      end: dayStart + 90,
+      note: ""
+    };
+    setPlan({
+      ...plan,
+      blocks: [...blocks, nb].sort((a, b) => a.start - b.start)
+    });
+    setEditing(nb.id);
+  };
+  const eb = blocks.find(b => b.id === editing);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "btp"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+    className: "wrap"
+  }, /*#__PURE__*/React.createElement(Header, {
+    back: true,
+    onBack: onReplan
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "eyebrow"
+  }, "Step 3 of 3 · Tap any block to adjust it"), /*#__PURE__*/React.createElement("h2", null, new Date(plan.dateKey + "T12:00").toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "sub"
+  }, fmt(dayStart), " wake → ", fmt(dayEnd - 30), " asleep · prayers anchored · ", plan.ai ? "planned by AI" : "rule-based plan"), /*#__PURE__*/React.createElement("div", {
+    className: "ptimes",
+    style: {
+      marginBottom: 12
+    }
+  }, nextPrayer && /*#__PURE__*/React.createElement("span", {
+    className: "ptag"
+  }, nextPrayer.title, " in ", npMins >= 60 ? Math.floor(npMins / 60) + "h " : "", npMins % 60, "m"), /*#__PURE__*/React.createElement("span", {
+    className: "ptag",
+    style: {
+      borderColor: "rgba(143,167,232,.4)",
+      color: "#8FA7E8",
+      background: "rgba(143,167,232,.08)"
+    }
+  }, Math.round(deepMins / 6) / 10, "h deep"), fitMins > 0 && /*#__PURE__*/React.createElement("span", {
+    className: "ptag",
+    style: {
+      borderColor: "rgba(127,192,139,.4)",
+      color: "#7FC08B",
+      background: "rgba(127,192,139,.08)"
+    }
+  }, fitMins, "m fitness"), /*#__PURE__*/React.createElement("span", {
+    className: "ptag",
+    style: {
+      borderColor: "rgba(180,154,214,.4)",
+      color: "#B49AD6",
+      background: "rgba(180,154,214,.08)"
+    }
+  }, doneCount, "/", blocks.filter(b => b.cat !== "sleep").length, " done")), hardline && /*#__PURE__*/React.createElement("div", {
+    className: "pin"
+  }, /*#__PURE__*/React.createElement("b", null, "Non-negotiable:"), " ", hardline), /*#__PURE__*/React.createElement("div", {
+    className: "tl"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "rail",
+    style: {
+      background: railBg
+    }
+  }), (() => {
+    const items = [];
+    let prevEnd = dayStart;
+    let nowPlaced = !isToday || nm < dayStart - 5 || nm > dayEnd;
+    blocks.forEach((b, idx) => {
+      if (!nowPlaced && nm <= b.start) {
+        items.push(/*#__PURE__*/React.createElement("div", {
+          key: "now",
+          className: "nowline"
+        }, /*#__PURE__*/React.createElement("span", null, fmt(nm))));
+        nowPlaced = true;
+      }
+      const gap = b.start - prevEnd;
+      if (gap >= 20) items.push(/*#__PURE__*/React.createElement("div", {
+        key: "g" + idx,
+        className: "gapdiv"
+      }, "· ", gap >= 60 ? Math.floor(gap / 60) + "h " + (gap % 60 ? gap % 60 + "m" : "") : gap + "m", " open ·"));
+      items.push(/*#__PURE__*/React.createElement("button", {
+        key: b.id,
+        className: `blk ${b.done ? "isdone" : ""}`,
+        style: {
+          borderLeftColor: CATS[b.cat].color,
+          borderStyle: b.cat === "sleep" ? "dashed" : "solid",
+          background: b.cat === "sleep" ? "transparent" : undefined
+        },
+        onClick: () => setEditing(b.id)
+      }, b.cat === "prayer" && /*#__PURE__*/React.createElement("span", {
+        className: "pdiamond"
+      }), b.cat !== "sleep" && /*#__PURE__*/React.createElement("span", {
+        role: "checkbox",
+        "aria-checked": !!b.done,
+        onClick: e => {
+          e.stopPropagation();
+          toggleDone(b.id);
+        },
+        className: "donec",
+        style: {
+          borderColor: b.done ? CATS[b.cat].color : "#3a4158",
+          color: CATS[b.cat].color
+        }
+      }, b.done ? "\u2713" : ""), /*#__PURE__*/React.createElement("div", {
+        className: "t",
+        style: {
+          color: b.cat === "prayer" ? CATS.prayer.color : undefined
+        }
+      }, b.title), /*#__PURE__*/React.createElement("div", {
+        className: "tm"
+      }, fmt(b.start), " \\u2013 ", fmt(b.end), " \\u00B7 ", b.end - b.start, "m"), b.note ? /*#__PURE__*/React.createElement("div", {
+        className: "nt"
+      }, b.note) : null));
+      prevEnd = Math.max(prevEnd, b.end);
+    });
+    if (!nowPlaced && nm <= dayEnd + 30) items.push(/*#__PURE__*/React.createElement("div", {
+      key: "now",
+      className: "nowline"
+    }, /*#__PURE__*/React.createElement("span", null, fmt(nm))));
+    return items;
+  })()), /*#__PURE__*/React.createElement("div", {
+    className: "barbtns"
+  }, canReplan && isToday && /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost",
+    style: {
+      marginBottom: 8
+    },
+    onClick: onReplanRest
+  }, "⟳ Replan the rest of today (AI)"), /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: onReplan
+  }, "Replan"), /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: () => {
+      const txt = `Plan \u2014 ${plan.dateKey}\n` + blocks.map(b => `${fmt(b.start)}\u2013${fmt(b.end)}  ${b.title}${b.note ? " \u2014 " + b.note : ""}`).join("\n");
+      navigator.clipboard.writeText(txt).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }).catch(() => {});
+    }
+  }, copied ? "Copied \u2713" : "Copy"), /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: downloadIcs
+  }, "→ Calendar"), /*#__PURE__*/React.createElement("button", {
+    className: "btn grow",
+    onClick: onSave
+  }, "Save"))), /*#__PURE__*/React.createElement("button", {
+    className: "fab",
+    onClick: addBlock,
+    "aria-label": "Add block"
+  }, "+"), savedFlash && /*#__PURE__*/React.createElement("div", {
+    className: "flash"
+  }, "Plan saved ✓")), eb && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "scrim",
+    onClick: () => setEditing(null)
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "sheet"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Block"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: eb.title,
+    onChange: e => update(eb.id, {
+      title: e.target.value
+    }),
+    style: {
+      marginBottom: 10
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "row",
+    style: {
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Start"), /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: toInputVal(eb.start),
+    onChange: e => {
+      const v = fromInputVal(e.target.value);
+      if (v != null) update(eb.id, {
+        start: v < 240 ? v + 1440 : v,
+        end: Math.max(eb.end, (v < 240 ? v + 1440 : v) + 15)
+      });
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "End"), /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: toInputVal(eb.end),
+    onChange: e => {
+      let v = fromInputVal(e.target.value);
+      if (v != null) {
+        if (v <= eb.start % 1440 && eb.start >= 1440) v += 1440;else if (v <= eb.start) v += 1440;
+        update(eb.id, {
+          end: v
+        });
+      }
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Type"), /*#__PURE__*/React.createElement("select", {
+    value: eb.cat,
+    onChange: e => update(eb.id, {
+      cat: e.target.value
+    })
+  }, Object.entries(CATS).map(([k, v]) => /*#__PURE__*/React.createElement("option", {
+    key: k,
+    value: k
+  }, v.label))))), /*#__PURE__*/React.createElement("div", {
+    className: "chiprow",
+    style: {
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => update(eb.id, {
+      start: eb.start - 15,
+      end: eb.end - 15
+    })
+  }, "◂ 15 min earlier"), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => update(eb.id, {
+      start: eb.start + 15,
+      end: eb.end + 15
+    })
+  }, "15 min later ▸"), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => update(eb.id, {
+      end: eb.end + 15
+    })
+  }, "+15 longer"), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => eb.end - eb.start > 15 && update(eb.id, {
+      end: eb.end - 15
+    })
+  }, "−15 shorter")), /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Note"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: eb.note || "",
+    onChange: e => update(eb.id, {
+      note: e.target.value
+    }),
+    style: {
+      marginBottom: 12
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost del grow",
+    onClick: () => remove(eb.id)
+  }, "Delete"), /*#__PURE__*/React.createElement("button", {
+    className: "btn grow",
+    onClick: () => setEditing(null)
+  }, "Done")))));
+}
+
+/* ============================================================
+   SETTINGS / FIRST-RUN SETUP
+   ============================================================ */
+function SettingsView({
+  css,
+  firstRun,
+  settings,
+  recurring,
+  onDone,
+  accountEmail,
+  onSignOut,
+  onExport
+}) {
+  const [city, setCity] = useState(settings?.city || null);
+  const [custom, setCustom] = useState({
+    name: "",
+    lat: "",
+    lng: ""
+  });
+  const [method, setMethod] = useState(settings?.method || "ISNA");
+  const [asrFactor, setAsrFactor] = useState(settings?.asrFactor || 1);
+  const [attendJumuah, setAttendJumuah] = useState(settings ? settings.attendJumuah !== false : true);
+  const [jumuahTime, setJumuahTime] = useState(settings?.jumuahTime || "13:30");
+  const [includeQuran, setIncludeQuran] = useState(settings ? settings.includeQuran !== false : true);
+  const [groqKey, setGroqKey] = useState(settings?.groqKey || "");
+  const [aiProfile, setAiProfile] = useState(settings?.aiProfile || "21-year-old Muslim college student in Fishers, Indiana. ~40 minute commute each way to campus/downtown Indianapolis. Prays 5x daily, non-negotiable. Health-conscious: whole foods, hydration, gym/tennis/pickleball. Protects sleep. Biomedical informatics coursework and research need real deep-focus blocks.");
+  const [wake, setWake] = useState(settings?.wake || "06:00");
+  const [sleep, setSleep] = useState(settings?.sleep || "23:00");
+  const [rec, setRec] = useState(recurring);
+  const [nr, setNr] = useState({
+    title: "",
+    days: [],
+    start: "09:00",
+    end: "10:00"
+  });
+  const [filter, setFilter] = useState("");
+  const cityList = CITIES.filter(c => c.name.toLowerCase().includes(filter.toLowerCase()));
+  const addRec = () => {
+    if (!nr.title || nr.days.length === 0) return;
+    setRec([...rec, {
+      ...nr,
+      id: uid()
+    }]);
+    setNr({
+      title: "",
+      days: [],
+      start: "09:00",
+      end: "10:00"
+    });
+  };
+  const done = () => {
+    let c = city;
+    if (!c && custom.name && custom.lat && custom.lng) c = {
+      name: custom.name,
+      lat: Number(custom.lat),
+      lng: Number(custom.lng)
+    };
+    if (!c) return;
+    onDone({
+      city: c,
+      method,
+      asrFactor,
+      wake,
+      sleep,
+      groqKey: groqKey.trim(),
+      aiProfile: aiProfile.trim(),
+      attendJumuah,
+      jumuahTime,
+      includeQuran
+    }, rec);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "btp"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+    className: "wrap"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "topbar"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "brand"
+  }, "block", /*#__PURE__*/React.createElement("em", null, "·"), "time")), /*#__PURE__*/React.createElement("div", {
+    className: "eyebrow"
+  }, firstRun ? "One-time setup" : "Settings"), /*#__PURE__*/React.createElement("h2", null, firstRun ? "Set once, plan nightly" : "Your standing setup"), /*#__PURE__*/React.createElement("div", {
+    className: "sub"
+  }, "City drives the five prayer times. Recurring commitments auto-fill each day's plan."), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Your city (for prayer times)"), city ? /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, city.name), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => setCity(null)
+  }, "Change")) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    placeholder: "Search cities…",
+    value: filter,
+    onChange: e => setFilter(e.target.value),
+    style: {
+      marginBottom: 8
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    style: {
+      marginBottom: 10
+    },
+    onClick: () => {
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition(pos => setCity({
+        name: "My location",
+        lat: Math.round(pos.coords.latitude * 1000) / 1000,
+        lng: Math.round(pos.coords.longitude * 1000) / 1000
+      }), () => {});
+    }
+  }, "📍 Use my current location"), /*#__PURE__*/React.createElement("div", {
+    className: "chiprow",
+    style: {
+      maxHeight: 150,
+      overflowY: "auto"
+    }
+  }, cityList.slice(0, 10).map(c => /*#__PURE__*/React.createElement("button", {
+    key: c.name,
+    className: "chip",
+    onClick: () => setCity(c)
+  }, c.name))), /*#__PURE__*/React.createElement("label", {
+    className: "fld",
+    style: {
+      marginTop: 12
+    }
+  }, "Not listed? Enter coordinates"), /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    placeholder: "Name",
+    value: custom.name,
+    onChange: e => setCustom({
+      ...custom,
+      name: e.target.value
+    }),
+    className: "grow"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    placeholder: "Lat",
+    value: custom.lat,
+    onChange: e => setCustom({
+      ...custom,
+      lat: e.target.value
+    }),
+    style: {
+      width: 90
+    }
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    placeholder: "Lng",
+    value: custom.lng,
+    onChange: e => setCustom({
+      ...custom,
+      lng: e.target.value
+    }),
+    style: {
+      width: 90
+    }
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginTop: 8
+    }
+  }, "Times use your device's timezone — keep it matched to this city.")), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Calculation method"), /*#__PURE__*/React.createElement("select", {
+    value: method,
+    onChange: e => setMethod(e.target.value)
+  }, Object.entries(METHODS).map(([k, v]) => /*#__PURE__*/React.createElement("option", {
+    key: k,
+    value: k
+  }, v.label)))), /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Asr"), /*#__PURE__*/React.createElement("select", {
+    value: asrFactor,
+    onChange: e => setAsrFactor(Number(e.target.value))
+  }, /*#__PURE__*/React.createElement("option", {
+    value: 1
+  }, "Standard"), /*#__PURE__*/React.createElement("option", {
+    value: 2
+  }, "Hanafi"))))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Default wake / asleep-by (editable nightly)"), /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: wake,
+    onChange: e => setWake(e.target.value),
+    className: "grow"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: sleep,
+    onChange: e => setSleep(e.target.value),
+    className: "grow"
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Jumu'ah on Fridays"), /*#__PURE__*/React.createElement("div", {
+    className: "chiprow"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: `chip ${attendJumuah ? "on" : ""}`,
+    onClick: () => setAttendJumuah(true)
+  }, "I attend"), /*#__PURE__*/React.createElement("button", {
+    className: `chip ${!attendJumuah ? "on" : ""}`,
+    onClick: () => setAttendJumuah(false)
+  }, "Regular Dhuhr")), attendJumuah && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Khutbah time at your masjid"), /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: jumuahTime,
+    onChange: e => setJumuahTime(e.target.value),
+    style: {
+      width: 140
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginTop: 6
+    }
+  }, "Fridays get a Jumu'ah block with a 30-min leave-early buffer instead of regular Dhuhr.")), /*#__PURE__*/React.createElement("label", {
+    className: "fld",
+    style: {
+      marginTop: 14
+    }
+  }, "Daily Qur'an & dhikr block"), /*#__PURE__*/React.createElement("div", {
+    className: "chiprow"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: `chip ${includeQuran ? "on" : ""}`,
+    onClick: () => setIncludeQuran(true)
+  }, "Include (15m after Fajr)"), /*#__PURE__*/React.createElement("button", {
+    className: `chip ${!includeQuran ? "on" : ""}`,
+    onClick: () => setIncludeQuran(false)
+  }, "Skip"))), /*#__PURE__*/React.createElement("div", {
+    className: "card reclist"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Recurring weekly commitments"), rec.map(c => /*#__PURE__*/React.createElement("div", {
+    className: "row",
+    key: c.id
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "grow"
+  }, c.title, /*#__PURE__*/React.createElement("div", {
+    className: "mini"
+  }, c.days.map(d => DAYS[d]).join(" "), " · ", fmt(fromInputVal(c.start)), "–", fmt(fromInputVal(c.end)))), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => setRec(rec.filter(x => x.id !== c.id))
+  }, "Remove"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    placeholder: "Title (e.g. IBRI internship, Cold Plunge shift)",
+    value: nr.title,
+    onChange: e => setNr({
+      ...nr,
+      title: e.target.value
+    }),
+    style: {
+      marginBottom: 8
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "chiprow",
+    style: {
+      marginBottom: 8
+    }
+  }, DAYS.map((d, i) => /*#__PURE__*/React.createElement("button", {
+    key: d,
+    className: `chip ${nr.days.includes(i) ? "on" : ""}`,
+    onClick: () => setNr({
+      ...nr,
+      days: nr.days.includes(i) ? nr.days.filter(x => x !== i) : [...nr.days, i]
+    })
+  }, d))), /*#__PURE__*/React.createElement("div", {
+    className: "row",
+    style: {
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: nr.start,
+    onChange: e => setNr({
+      ...nr,
+      start: e.target.value
+    }),
+    className: "grow"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "time",
+    value: nr.end,
+    onChange: e => setNr({
+      ...nr,
+      end: e.target.value
+    }),
+    className: "grow"
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: addRec
+  }, "Add")))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "AI planning (recommended) — free Groq API key"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    autoCapitalize: "none",
+    placeholder: "gsk_...",
+    value: groqKey,
+    onChange: e => setGroqKey(e.target.value),
+    style: {
+      marginBottom: 8
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginBottom: 10
+    }
+  }, "With a key, the AI analyzes your task list — estimating durations, spotting deadlines, adding commute blocks — and plans the whole day itself. Without one, a simpler rule-based planner is used. Get a free key at console.groq.com → API Keys. Syncs to your devices; never put it in the code on GitHub."), /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "What the AI should know about you (editable)"), /*#__PURE__*/React.createElement("textarea", {
+    value: aiProfile,
+    onChange: e => setAiProfile(e.target.value),
+    style: {
+      minHeight: 110
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Baked-in preferences (applied automatically)"), /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      lineHeight: 1.7
+    }
+  }, "Five prayers anchor the day, with wudu buffers · deep work in high-energy windows · fitness spaced from meals · whole-food meals, never rushed · a daylight/movement break · screen-free wind-down · sleep is protected · 5-min transitions between everything")), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: done,
+    disabled: !city && !(custom.name && custom.lat && custom.lng),
+    style: {
+      opacity: city || custom.name && custom.lat && custom.lng ? 1 : 0.4
+    }
+  }, firstRun ? "Save & start planning" : "Save settings"), !firstRun && /*#__PURE__*/React.createElement("div", {
+    className: "card",
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Account & data"), accountEmail && /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginBottom: 10
+    }
+  }, "Signed in as ", accountEmail, " — data syncs to every device you sign in on."), /*#__PURE__*/React.createElement("div", {
+    className: "row"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: onExport
+  }, "Download backup"), /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost grow",
+    onClick: onSignOut
+  }, "Sign out")))));
+}
+
+/* ============================================================
+   SIGN IN / CREATE ACCOUNT
+   ============================================================ */
+function AuthView({
+  css,
+  onSignedIn
+}) {
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const go = async mode => {
+    if (!email || pw.length < 6) {
+      setMsg("Enter your email and a password of at least 6 characters.");
+      return;
+    }
+    setBusy(true);
+    setMsg("");
+    const client = getClient();
+    try {
+      const {
+        data,
+        error
+      } = mode === "up" ? await client.auth.signUp({
+        email,
+        password: pw
+      }) : await client.auth.signInWithPassword({
+        email,
+        password: pw
+      });
+      setBusy(false);
+      if (error) {
+        setMsg(error.message);
+        return;
+      }
+      if (mode === "up" && data.user && !data.session) {
+        setMsg("Account created — check your email for a confirmation link, then come back and sign in.");
+        return;
+      }
+      onSignedIn();
+    } catch (e) {
+      setBusy(false);
+      setMsg("Could not reach the server — check your connection.");
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "btp"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+    className: "wrap",
+    style: {
+      paddingTop: 40
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "brand",
+    style: {
+      marginBottom: 20
+    }
+  }, "block", /*#__PURE__*/React.createElement("em", null, "·"), "time"), /*#__PURE__*/React.createElement("div", {
+    className: "eyebrow"
+  }, "Your account"), /*#__PURE__*/React.createElement("h2", null, "Sign in once per device"), /*#__PURE__*/React.createElement("div", {
+    className: "sub"
+  }, "Your settings and plans sync to any device you sign in on. You stay signed in after this."), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Email"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    inputMode: "email",
+    autoCapitalize: "none",
+    value: email,
+    onChange: e => setEmail(e.target.value.trim()),
+    style: {
+      marginBottom: 10
+    }
+  }), /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Password (6+ characters)"), /*#__PURE__*/React.createElement("input", {
+    type: "password",
+    value: pw,
+    onChange: e => setPw(e.target.value)
+  }), msg && /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      color: "#E3A857",
+      marginTop: 10
+    }
+  }, msg)), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => go("in"),
+    disabled: busy,
+    style: {
+      marginBottom: 10,
+      opacity: busy ? 0.6 : 1
+    }
+  }, "Sign in"), /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost",
+    onClick: () => go("up"),
+    disabled: busy
+  }, "Create account"), /*#__PURE__*/React.createElement("div", {
+    className: "mini",
+    style: {
+      marginTop: 14
+    }
+  }, "First time here? Use \"Create account\" with any email + password you'll remember. Same email + password on your other devices.")));
+}
+
+/* ============================================================
+   CONNECT — only shown if the two config lines weren't filled in
+   ============================================================ */
+function ConnectView({
+  css,
+  onDone
+}) {
+  const [url, setUrl] = useState("");
+  const [key, setKey] = useState("");
+  return /*#__PURE__*/React.createElement("div", {
+    className: "btp"
+  }, /*#__PURE__*/React.createElement("style", null, css), /*#__PURE__*/React.createElement("div", {
+    className: "wrap",
+    style: {
+      paddingTop: 40
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "brand",
+    style: {
+      marginBottom: 20
+    }
+  }, "block", /*#__PURE__*/React.createElement("em", null, "·"), "time"), /*#__PURE__*/React.createElement("div", {
+    className: "eyebrow"
+  }, "One-time connection"), /*#__PURE__*/React.createElement("h2", null, "Connect your Supabase project"), /*#__PURE__*/React.createElement("div", {
+    className: "sub"
+  }, "Tip: it's easier to paste these two values into the top of index.html on GitHub (look for SUPABASE_URL) — then this screen never appears. But you can also enter them here for this device."), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Project URL (https://xxxx.supabase.co)"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    autoCapitalize: "none",
+    value: url,
+    onChange: e => setUrl(e.target.value.trim()),
+    style: {
+      marginBottom: 10
+    }
+  }), /*#__PURE__*/React.createElement("label", {
+    className: "fld"
+  }, "Anon public key (long string starting with \"ey\")"), /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    autoCapitalize: "none",
+    value: key,
+    onChange: e => setKey(e.target.value.trim())
+  })), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => url.startsWith("https://") && key.length > 20 && onDone({
+      url,
+      key
+    }),
+    style: {
+      opacity: url.startsWith("https://") && key.length > 20 ? 1 : 0.4
+    }
+  }, "Connect")));
+}
+ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
+</script>
+</body>
+</html>
